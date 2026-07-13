@@ -185,7 +185,7 @@ def get_disk_name(path: Path) -> str:
 
 
 def utcnow() -> str:
-    return dt.datetime.utcnow().isoformat() + "Z"
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
 
 
 # --- blob URL helpers --------------------------------------------------------
