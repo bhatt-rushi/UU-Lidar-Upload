@@ -389,6 +389,7 @@ def new_manifest(kind: str,
                  sensor: str | None, data_type: str | None,
                  collection_date: str,
                  system_name: str,
+                 pilot_name: str,
                  source_roots: list[str]) -> dict:
     now = utcnow()
     return {
@@ -402,6 +403,7 @@ def new_manifest(kind: str,
         "data_type": data_type,
         "collection_date": collection_date,
         "system_name": system_name,
+        "pilot_name": pilot_name,
         "source_roots": list(source_roots),
         "manifest_blob_path": manifest_blob_path_for(kind, client, program, feeder, collection_date),
         "created_utc": now,
@@ -527,6 +529,12 @@ class UploadSession:
         self._stop = threading.Event()
         self._zip_queue: queue.Queue = queue.Queue(maxsize=1)
         self._thread: threading.Thread | None = None
+        # rolling upload stats: list of (bytes, duration_seconds) for successful
+        # verified uploads. Speed is measured only on actual azcopy upload time
+        # (not including zip time, backoff sleeps, or manifest PUTs) so it
+        # reflects real network throughput.
+        self._recent_uploads: list[tuple[int, float]] = []
+        self._recent_window = 8
 
     def start(self):
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -543,13 +551,67 @@ class UploadSession:
         except Exception:
             pass
 
+    def _record_upload(self, size_bytes: int, duration_s: float):
+        if size_bytes <= 0 or duration_s <= 0:
+            return
+        self._recent_uploads.append((size_bytes, duration_s))
+        if len(self._recent_uploads) > self._recent_window:
+            self._recent_uploads.pop(0)
+
     def _progress(self, current: str = ""):
         try:
-            total = sum(len(m["items"]) for m, _ in self.manifests)
-            done = sum(1 for m, _ in self.manifests
-                       for it in m["items"].values()
-                       if it.get("status") == STATUS_VERIFIED)
-            self.progress_cb(done, total, current)
+            total = 0
+            done = 0
+            failed = 0
+            bytes_uploaded = 0
+            remaining_bytes = 0
+            known_sizes: list[int] = []
+            for m, _ in self.manifests:
+                for it in m["items"].values():
+                    total += 1
+                    size = it.get("zip_size_bytes") or it.get("size_bytes") or 0
+                    status = it.get("status")
+                    if status == STATUS_VERIFIED:
+                        done += 1
+                        bytes_uploaded += size
+                        known_sizes.append(size)
+                    else:
+                        # count pending failures too but only "failed" if global
+                        # retries are exhausted -- otherwise it will be retried
+                        if status == STATUS_FAILED and it.get("global_attempts", 0) >= self.advanced["global_retries"]:
+                            failed += 1
+                        if size:
+                            remaining_bytes += size
+            # fill in unknown sizes with the mean of what we've seen
+            if known_sizes:
+                mean = sum(known_sizes) / len(known_sizes)
+                unknown_count = sum(
+                    1 for m, _ in self.manifests
+                    for it in m["items"].values()
+                    if it.get("status") != STATUS_VERIFIED
+                    and not (it.get("zip_size_bytes") or it.get("size_bytes"))
+                )
+                remaining_bytes += int(mean * unknown_count)
+            # speed from recent uploads
+            if self._recent_uploads:
+                total_bytes = sum(b for b, _ in self._recent_uploads)
+                total_time = sum(t for _, t in self._recent_uploads)
+                speed_bps = total_bytes / total_time if total_time > 0 else 0.0
+            else:
+                speed_bps = 0.0
+            eta_s = (remaining_bytes / speed_bps) if speed_bps > 0 and remaining_bytes > 0 else None
+            stats = {
+                "done": done,
+                "total": total,
+                "failed": failed,
+                "remaining": total - done - failed,
+                "current": current,
+                "bytes_uploaded": bytes_uploaded,
+                "remaining_bytes": remaining_bytes,
+                "speed_bps": speed_bps,
+                "eta_seconds": eta_s,
+            }
+            self.progress_cb(stats)
         except Exception:
             pass
 
@@ -673,6 +735,7 @@ class UploadSession:
             item["status"] = STATUS_UPLOADING
             item["attempts"] = attempt
             self._log(f"[upload] {name}: attempt {attempt}/{self.advanced['local_retries']}")
+            up_start = time.monotonic()
             try:
                 azcopy_upload_file(zip_path, dest, timeout=timeout, put_md5=True)
             except Exception as e:
@@ -692,6 +755,8 @@ class UploadSession:
                 item["status"] = STATUS_VERIFIED
                 item["uploaded_utc"] = utcnow()
                 item["last_error"] = None
+                self._record_upload(item.get("zip_size_bytes") or 0,
+                                    time.monotonic() - up_start)
                 self._log(f"[verify] {name}: OK ({remote_md5})")
                 self._save_both(m, path)
                 self._progress(name)
@@ -731,6 +796,7 @@ class UploadSession:
                 item["status"] = STATUS_UPLOADING
                 item["attempts"] = attempt
                 self._log(f"[base] {name}: attempt {attempt}/{self.advanced['local_retries']}")
+                up_start = time.monotonic()
                 try:
                     azcopy_upload_file(src, dest, timeout=timeout, put_md5=True)
                 except Exception as e:
@@ -749,6 +815,8 @@ class UploadSession:
                     item["status"] = STATUS_VERIFIED
                     item["uploaded_utc"] = utcnow()
                     item["last_error"] = None
+                    self._record_upload(item.get("size_bytes") or 0,
+                                        time.monotonic() - up_start)
                     self._log(f"[base] {name}: verified")
                     self._save_both(m, path)
                     self._progress(name)
@@ -777,6 +845,38 @@ class UploadSession:
             self._stop.set()
             raise
         save_local_manifest(m, path)
+
+
+def _fmt_bytes(n: int) -> str:
+    if n <= 0:
+        return "0 B"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    i = 0
+    f = float(n)
+    while f >= 1024 and i < len(units) - 1:
+        f /= 1024
+        i += 1
+    return f"{f:.1f} {units[i]}"
+
+
+def _fmt_rate(bps: float) -> str:
+    if not bps or bps <= 0:
+        return "--"
+    # Show as B/s or KB/s or MB/s
+    return _fmt_bytes(int(bps)) + "/s"
+
+
+def _fmt_eta(secs: float | None) -> str:
+    if secs is None or secs <= 0:
+        return "--"
+    secs = int(secs)
+    h, rem = divmod(secs, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h {m}m"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
 
 
 def _make_zip(src_dir: Path, out_path: Path) -> None:
@@ -907,6 +1007,18 @@ class App(tk.Tk):
         ttk.Label(frame, textvariable=self.progress_var).pack(anchor="w")
         self.progress_bar = ttk.Progressbar(frame, maximum=1, value=0)
         self.progress_bar.pack(fill="x", pady=4)
+
+        stats_frame = ttk.Frame(frame)
+        stats_frame.pack(fill="x", pady=2)
+        self.speed_var = tk.StringVar(value="Speed: --")
+        self.eta_var = tk.StringVar(value="ETA: --")
+        self.failed_var = tk.StringVar(value="Failed: 0")
+        self.bytes_var = tk.StringVar(value="Uploaded: 0 B")
+        ttk.Label(stats_frame, textvariable=self.speed_var, width=22).pack(side="left")
+        ttk.Label(stats_frame, textvariable=self.eta_var, width=22).pack(side="left")
+        ttk.Label(stats_frame, textvariable=self.failed_var, width=16).pack(side="left")
+        ttk.Label(stats_frame, textvariable=self.bytes_var, width=26).pack(side="left")
+
         self.current_item = tk.StringVar(value="")
         ttk.Label(frame, textvariable=self.current_item).pack(anchor="w")
 
@@ -926,13 +1038,21 @@ class App(tk.Tk):
         self.log_widget.insert("end", f"{dt.datetime.now().strftime('%H:%M:%S')} {msg}\n")
         self.log_widget.see("end")
 
-    def _progress(self, done: int, total: int, current: str):
+    def _progress(self, stats: dict):
         def apply():
+            total = stats["total"]
+            done = stats["done"]
+            failed = stats["failed"]
+            remaining = stats["remaining"]
             self.progress_bar["maximum"] = max(total, 1)
             self.progress_bar["value"] = done
-            self.progress_var.set(f"{done} / {total} items verified")
-            if current:
-                self.current_item.set(f"Last: {current}")
+            self.progress_var.set(f"{done} verified / {remaining} remaining / {total} total")
+            self.failed_var.set(f"Failed: {failed}")
+            self.speed_var.set(f"Speed: {_fmt_rate(stats['speed_bps'])}")
+            self.eta_var.set(f"ETA: {_fmt_eta(stats['eta_seconds'])}")
+            self.bytes_var.set(f"Uploaded: {_fmt_bytes(stats['bytes_uploaded'])}")
+            if stats["current"]:
+                self.current_item.set(f"Last: {stats['current']}")
         self.after(0, apply)
 
     def _done(self, ok: bool, msg: str):
@@ -1001,8 +1121,17 @@ class NewUploadWizard(tk.Toplevel):
         self.parent_app = parent
         self.on_ready = on_ready
 
+        # ensure the wizard opens ON TOP of the main window rather than behind it
+        self.transient(parent)
+        self.lift()
+        self.attributes("-topmost", True)
+        self.after(300, lambda: self.attributes("-topmost", False))
+        self.focus_force()
+        self.grab_set()
+
         self.client_var = tk.StringVar(value=VALID_CLIENTS[0])
         self.program_var = tk.StringVar(value=VALID_PROGRAMS[0])
+        self.pilot_var = tk.StringVar()
         self.feeder_var = tk.StringVar()
         self.feeder_confirm_var = tk.StringVar()
         self.sensor_var = tk.StringVar(value="L3")
@@ -1020,6 +1149,9 @@ class NewUploadWizard(tk.Toplevel):
         ttk.Label(self, text="Program").grid(row=row, column=0, sticky="w", **pad)
         ttk.Combobox(self, values=VALID_PROGRAMS, textvariable=self.program_var,
                      state="readonly").grid(row=row, column=1, sticky="ew", **pad)
+        row += 1
+        ttk.Label(self, text="Pilot name").grid(row=row, column=0, sticky="w", **pad)
+        ttk.Entry(self, textvariable=self.pilot_var).grid(row=row, column=1, sticky="ew", **pad)
         row += 1
         ttk.Label(self, text="Feeder (e.g. LAW322)").grid(row=row, column=0, sticky="w", **pad)
         e = ttk.Entry(self, textvariable=self.feeder_var)
@@ -1092,6 +1224,10 @@ class NewUploadWizard(tk.Toplevel):
 
     def _scan(self):
         self.report.delete("1.0", "end")
+        pilot = self.pilot_var.get().strip()
+        if not pilot:
+            messagebox.showerror("Missing pilot", "Enter the pilot's name before scanning.")
+            return
         feeder = self.feeder_var.get().strip().upper()
         confirm = self.feeder_confirm_var.get().strip().upper()
         if not feeder or feeder != confirm:
@@ -1197,6 +1333,7 @@ class NewUploadWizard(tk.Toplevel):
         sensor = self.sensor_var.get()
         data_type = s["data_type"] or DATA_TYPE_RAW
         system_name = get_system_name()
+        pilot_name = self.pilot_var.get().strip()
 
         if adv.get("create_readmes", True):
             try:
@@ -1218,6 +1355,7 @@ class NewUploadWizard(tk.Toplevel):
                 client=client, program=program, feeder=feeder,
                 sensor=sensor, data_type=data_type,
                 collection_date=date, system_name=system_name,
+                pilot_name=pilot_name,
                 source_roots=source_roots,
             )
             for it in items:
@@ -1240,6 +1378,7 @@ class NewUploadWizard(tk.Toplevel):
                 client=client, program=program, feeder=feeder,
                 sensor=None, data_type=None,
                 collection_date=bi["date"], system_name=system_name,
+                pilot_name=pilot_name,
                 source_roots=source_roots,
             )
             for p in bi["files"]:
