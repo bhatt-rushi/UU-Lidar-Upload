@@ -1157,9 +1157,16 @@ def verify_manifest_for_deletion(m: dict,
 
         local_path = Path(item["original_path"])
         if not local_path.exists():
-            # Already deleted -- fine from a "safe to delete" perspective:
-            # the blob is proven intact, and there is nothing left locally.
-            _record(name, None)
+            # Blob is proven intact, but the recorded local source is gone.
+            # Two possibilities we cannot tell apart from here: the pilot
+            # already deleted the data (fine) OR they renamed / moved the
+            # parent directory (the tool has no way to find the new
+            # location and would silently miss content drift). Report as a
+            # WARNING category so the verdict distinguishes it from a full
+            # verified pass; the dialog offers a prefix remap to retarget
+            # the check at the new location.
+            _record(name, "local_missing",
+                    f"{name}: local source not found at {local_path}")
             continue
 
         if m["kind"] == KIND_SENSOR:
@@ -1880,6 +1887,20 @@ class DeletionCheckDialog(tk.Toplevel):
         ttk.Button(search, text="Open registry folder",
                    command=self._open_registry_folder).pack(side="left", padx=4)
 
+        # Optional local-prefix remap so a check can retarget when the pilot
+        # renamed / moved the parent directory holding the raw data. This is
+        # applied to a COPY of the manifest for the check only; nothing is
+        # written back to disk (unlike the Resume drive-remap flow).
+        remap = ttk.Frame(self, padding=(8, 0))
+        remap.pack(fill="x")
+        ttk.Label(remap, text="Local prefix remap (optional):").pack(side="left")
+        ttk.Label(remap, text="  Old").pack(side="left")
+        self.old_prefix_var = tk.StringVar()
+        ttk.Entry(remap, textvariable=self.old_prefix_var, width=28).pack(side="left", padx=4)
+        ttk.Label(remap, text="New").pack(side="left")
+        self.new_prefix_var = tk.StringVar()
+        ttk.Entry(remap, textvariable=self.new_prefix_var, width=28).pack(side="left", padx=4)
+
         tree_frame = ttk.Frame(self)
         tree_frame.pack(fill="both", expand=True, padx=8, pady=4)
         self.tree = ttk.Treeview(tree_frame, columns=self.COLUMNS, show="headings",
@@ -1969,6 +1990,21 @@ class DeletionCheckDialog(tk.Toplevel):
         if not m:
             messagebox.showerror("Load failed", "Could not read that manifest.")
             return
+
+        # Optional prefix remap for the CHECK ONLY. Deep-copy the manifest so
+        # we don't mutate the registry copy. If the pilot presses Repair later
+        # we use the original manifest (repair should touch cloud-side items,
+        # which are independent of local paths).
+        old = self.old_prefix_var.get()
+        new = self.new_prefix_var.get()
+        if (old and not new) or (new and not old):
+            messagebox.showerror("Incomplete remap",
+                                 "Fill both Old and New prefix, or leave both empty.")
+            return
+        m_check = json.loads(json.dumps(m))  # deep copy
+        if old and new:
+            _remap_paths(m_check, old, new)
+
         self.result_text.delete("1.0", "end")
         self.verdict_var.set("Verifying against blob... please wait.")
         self._cancel.clear()
@@ -1976,7 +2012,7 @@ class DeletionCheckDialog(tk.Toplevel):
         self.repair_btn.state(["disabled"])
         self._last_result = None
         self._last_result_path = path
-        threading.Thread(target=self._verify_worker, args=(m, path), daemon=True).start()
+        threading.Thread(target=self._verify_worker, args=(m_check, path), daemon=True).start()
 
     def _verify_worker(self, m: dict, path: Path):
         def log(msg: str):
@@ -1996,19 +2032,51 @@ class DeletionCheckDialog(tk.Toplevel):
         def finish():
             self.stop_btn.state(["disabled"])
             self._last_result = result
+            item_results = result.get("item_results") or {}
+            hard_issues = [
+                n for n, r in item_results.items()
+                if r.get("category") not in (None, "local_missing")
+            ]
+            local_missing = [
+                n for n, r in item_results.items()
+                if r.get("category") == "local_missing"
+            ]
             if self._cancel.is_set():
                 self.verdict_var.set("Cancelled.")
-            elif result["ok"]:
+            elif hard_issues:
                 self.verdict_var.set(
-                    f"SAFE TO DELETE  --  all {result['checked']} item(s) verified against the blob."
-                )
-            else:
-                self.verdict_var.set(
-                    f"NOT SAFE  --  {len(result['issues'])} issue(s) found across "
+                    f"NOT SAFE  --  {len(hard_issues)} issue(s) across "
                     f"{result['checked']} checked item(s). See details below."
                 )
-                for issue in result["issues"]:
-                    self._append(f"  !! {issue}\n")
+                for n in hard_issues:
+                    self._append(f"  !! {item_results[n]['detail']}\n")
+                if local_missing:
+                    self._append(
+                        f"\n{len(local_missing)} additional item(s) had a missing "
+                        f"local source (see below).\n"
+                    )
+                    for n in local_missing:
+                        self._append(f"  ?? {item_results[n]['detail']}\n")
+            elif local_missing:
+                # Cloud is intact for every item, but the local sources are
+                # not where the manifest says they should be. Could mean the
+                # pilot already deleted them (safe) OR renamed/moved the
+                # parent directory (we cannot tell). Do NOT declare SAFE.
+                self.verdict_var.set(
+                    f"CLOUD INTACT, LOCAL UNKNOWN  --  blob verified for all "
+                    f"{result['checked']} item(s), but {len(local_missing)} local "
+                    f"source(s) not found at the recorded path. If you already "
+                    f"deleted the data, this is expected -- deletion is safe. "
+                    f"If you renamed / moved the parent folder, use the Local "
+                    f"prefix remap above to retarget the check."
+                )
+                for n in local_missing:
+                    self._append(f"  ?? {item_results[n]['detail']}\n")
+            else:
+                self.verdict_var.set(
+                    f"SAFE TO DELETE  --  all {result['checked']} item(s) verified "
+                    f"against the blob AND locally."
+                )
             # If any items are repairable (blob missing/mismatched), enable
             # the Repair button so the pilot can reset them to pending
             # and re-upload.
