@@ -115,7 +115,12 @@ DEFAULT_ADVANCED = {
     "timeout_seconds": 3600,     # T: azcopy per-call timeout
     "create_readmes": CREATE_DIR_READMES_DEFAULT,
     "zip_scratch_dir": "",       # "" -> system temp
+    "retry_failed_forever": False,   # after the initial pass, keep retrying
+                                     # any items in status=failed forever,
+                                     # sleeping 5 minutes between passes
 }
+
+RETRY_FAILED_INTERVAL_SECONDS = 300
 
 STATUS_PENDING = "pending"
 STATUS_ZIPPING = "zipping"
@@ -615,27 +620,74 @@ class UploadSession:
             for m, path in self.manifests:
                 self._prepare(m, path)
             self._progress()
+            self._run_one_pass()
 
-            # SENSOR manifests get zipper+uploader; BASE do direct upload.
-            sensor_manifests = [(m, p) for m, p in self.manifests if m["kind"] == KIND_SENSOR]
-            base_manifests = [(m, p) for m, p in self.manifests if m["kind"] == KIND_BASE]
-
-            if sensor_manifests:
-                zipper = threading.Thread(target=self._zip_loop,
-                                          args=(sensor_manifests,), daemon=True)
-                zipper.start()
-                self._sensor_upload_loop(sensor_manifests)
-                zipper.join(timeout=5)
-
-            for m, p in base_manifests:
-                if self._stop.is_set():
-                    break
-                self._base_upload(m, p)
+            # Optional: retry anything still status=failed forever, sleeping
+            # RETRY_FAILED_INTERVAL_SECONDS between passes, until either every
+            # item verifies or the user stops the session.
+            if self.advanced.get("retry_failed_forever"):
+                while not self._stop.is_set():
+                    n_failed = self._count_failed()
+                    if n_failed == 0:
+                        break
+                    self._log(f"[retry] {n_failed} item(s) still failed; "
+                              f"sleeping {RETRY_FAILED_INTERVAL_SECONDS}s before next pass")
+                    self._sleep_interruptible(RETRY_FAILED_INTERVAL_SECONDS)
+                    if self._stop.is_set():
+                        break
+                    n_reset = self._reset_failed_to_pending()
+                    self._log(f"[retry] reset {n_reset} item(s) to pending; starting next pass")
+                    self._run_one_pass()
 
             self.done_cb(True, "All uploads finished.")
         except Exception as e:
             self._log(f"FATAL: {e}\n{traceback.format_exc()}")
             self.done_cb(False, str(e))
+
+    def _run_one_pass(self):
+        """One pass through every manifest. SENSOR manifests get the
+        zipper+uploader pipeline; BASE manifests get direct upload.
+        VERIFIED items are skipped inside each pipeline."""
+        sensor_manifests = [(m, p) for m, p in self.manifests if m["kind"] == KIND_SENSOR]
+        base_manifests = [(m, p) for m, p in self.manifests if m["kind"] == KIND_BASE]
+
+        if sensor_manifests and not self._stop.is_set():
+            self._zip_queue = queue.Queue(maxsize=1)  # fresh queue each pass
+            zipper = threading.Thread(target=self._zip_loop,
+                                      args=(sensor_manifests,), daemon=True)
+            zipper.start()
+            self._sensor_upload_loop(sensor_manifests)
+            zipper.join(timeout=5)
+
+        for m, p in base_manifests:
+            if self._stop.is_set():
+                break
+            self._base_upload(m, p)
+
+    def _count_failed(self) -> int:
+        return sum(1 for m, _ in self.manifests
+                   for it in m["items"].values()
+                   if it.get("status") == STATUS_FAILED)
+
+    def _reset_failed_to_pending(self) -> int:
+        n = 0
+        for m, path in self.manifests:
+            dirty = False
+            for it in m["items"].values():
+                if it.get("status") == STATUS_FAILED:
+                    it["status"] = STATUS_PENDING
+                    it["attempts"] = 0
+                    n += 1
+                    dirty = True
+            if dirty:
+                save_local_manifest(m, path)
+        return n
+
+    def _sleep_interruptible(self, seconds: int):
+        for _ in range(seconds):
+            if self._stop.is_set():
+                return
+            time.sleep(1)
 
     # ---- prepare (merge with cloud) ----
 
@@ -1085,18 +1137,26 @@ class AdvancedDialog(tk.Toplevel):
         ttk.Checkbutton(self, text="Create tiny README.txt per feeder subdirectory (so empty dirs persist)",
                         variable=readme_var).grid(row=len(rows), column=0, columnspan=2, sticky="w", padx=8, pady=8)
 
+        retry_var = tk.BooleanVar(value=bool(advanced.get("retry_failed_forever", False)))
+        ttk.Checkbutton(self,
+                        text=f"After first pass, keep retrying failed uploads forever "
+                             f"({RETRY_FAILED_INTERVAL_SECONDS // 60} min between passes)",
+                        variable=retry_var).grid(row=len(rows) + 1, column=0, columnspan=2,
+                                                 sticky="w", padx=8, pady=(0, 8))
+
         def save():
             try:
                 for key, (v, t) in vars_.items():
                     val = v.get().strip()
                     advanced[key] = t(val) if val or t is str else t(0)
                 advanced["create_readmes"] = readme_var.get()
+                advanced["retry_failed_forever"] = retry_var.get()
             except Exception as e:
                 messagebox.showerror("Bad value", str(e))
                 return
             self.destroy()
 
-        ttk.Button(self, text="Save", command=save).grid(row=len(rows) + 1, column=1, sticky="e", padx=8, pady=8)
+        ttk.Button(self, text="Save", command=save).grid(row=len(rows) + 2, column=1, sticky="e", padx=8, pady=8)
         self.transient(parent)
         self.grab_set()
 
