@@ -237,7 +237,15 @@ class AzcopyError(RuntimeError):
     pass
 
 
-def _run_azcopy(args: list[str], timeout: int) -> subprocess.CompletedProcess:
+def _run_azcopy_streaming(args: list[str], timeout: int,
+                          on_progress=None) -> None:
+    """Run azcopy with JSON-line stdout so we can surface live progress.
+
+    ``on_progress(bytes_over_wire)`` is called each time azcopy emits a
+    Progress message. Its argument is the cumulative bytes-over-wire count
+    for the whole azcopy job (which, for our single-file copies, equals the
+    bytes uploaded so far for this transfer).
+    """
     exe = azcopy_path()
     if not exe.exists():
         raise AzcopyError(
@@ -245,27 +253,71 @@ def _run_azcopy(args: list[str], timeout: int) -> subprocess.CompletedProcess:
         )
     env = os.environ.copy()
     env["AZCOPY_LOG_LEVEL"] = "ERROR"
+
+    creationflags = 0
+    if os.name == "nt":
+        # avoid a black console window flashing when azcopy is spawned from Tk
+        creationflags = 0x08000000  # CREATE_NO_WINDOW
+
+    proc = subprocess.Popen(
+        [str(exe)] + args + ["--output-type=json"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        creationflags=creationflags,
+        bufsize=1,
+    )
+    stderr_chunks: list[str] = []
+
+    def _drain_stderr():
+        try:
+            assert proc.stderr is not None
+            for line in proc.stderr:
+                stderr_chunks.append(line)
+        except Exception:
+            pass
+
+    threading.Thread(target=_drain_stderr, daemon=True).start()
+
+    deadline = time.monotonic() + timeout
     try:
-        return subprocess.run(
-            [str(exe)] + args,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=env,
-        )
-    except subprocess.TimeoutExpired as e:
-        raise AzcopyError(f"azcopy timed out after {timeout}s") from e
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            if time.monotonic() > deadline:
+                proc.kill()
+                raise AzcopyError(f"azcopy timed out after {timeout}s")
+            line = line.strip()
+            if not line or not line.startswith("{"):
+                continue
+            try:
+                msg = json.loads(line)
+            except Exception:
+                continue
+            if on_progress and msg.get("MessageType") == "Progress":
+                try:
+                    content = json.loads(msg.get("MessageContent", "{}"))
+                    bytes_over_wire = int(content.get("BytesOverWire", 0))
+                    on_progress(bytes_over_wire)
+                except Exception:
+                    pass
+    finally:
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+    if proc.returncode != 0:
+        err = "".join(stderr_chunks).strip()
+        raise AzcopyError(f"azcopy failed (rc={proc.returncode}): {err[:400]}")
 
 
-def azcopy_upload_file(local: Path, dest_url: str, timeout: int, put_md5: bool = True) -> None:
-    args = ["copy", str(local), dest_url, "--log-level=ERROR", "--output-level=essential"]
+def azcopy_upload_file(local: Path, dest_url: str, timeout: int,
+                       put_md5: bool = True, on_progress=None) -> None:
+    args = ["copy", str(local), dest_url, "--log-level=ERROR"]
     if put_md5:
         args.append("--put-md5")
-    r = _run_azcopy(args, timeout)
-    if r.returncode != 0:
-        raise AzcopyError(
-            f"azcopy failed (rc={r.returncode}): {r.stderr.strip() or r.stdout.strip()}"
-        )
+    _run_azcopy_streaming(args, timeout=timeout, on_progress=on_progress)
 
 
 # --- blob REST (manifest + verify) -------------------------------------------
@@ -537,6 +589,16 @@ class UploadSession:
         # reflects real network throughput.
         self._recent_uploads: list[tuple[int, float]] = []
         self._recent_window = 8
+        # live in-flight transfer state, updated by the azcopy JSON-stream
+        # parser; the UI ticker samples it at 500ms cadence.
+        self._current_lock = threading.Lock()
+        self._current_transfer: dict = {
+            "name": None,
+            "size_bytes": 0,
+            "bytes_over_wire": 0,
+            "start_monotonic": None,
+        }
+        self._done_flag = threading.Event()
 
     def start(self):
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -552,6 +614,37 @@ class UploadSession:
             self.log_cb(msg)
         except Exception:
             pass
+
+    def _start_transfer(self, name: str, size_bytes: int):
+        with self._current_lock:
+            self._current_transfer = {
+                "name": name,
+                "size_bytes": size_bytes,
+                "bytes_over_wire": 0,
+                "start_monotonic": time.monotonic(),
+            }
+
+    def _update_transfer(self, bytes_over_wire: int):
+        with self._current_lock:
+            self._current_transfer["bytes_over_wire"] = bytes_over_wire
+
+    def _end_transfer(self):
+        with self._current_lock:
+            self._current_transfer = {
+                "name": None,
+                "size_bytes": 0,
+                "bytes_over_wire": 0,
+                "start_monotonic": None,
+            }
+
+    def _ticker(self):
+        """Drive live progress updates while a session is running."""
+        while not self._stop.is_set() and not self._done_flag.is_set():
+            try:
+                self._progress()
+            except Exception:
+                pass
+            time.sleep(0.5)
 
     def _record_upload(self, size_bytes: int, duration_s: float):
         if size_bytes <= 0 or duration_s <= 0:
@@ -582,7 +675,6 @@ class UploadSession:
                             failed += 1
                         if size:
                             remaining_bytes += size
-            # fill in unknown sizes with the mean of what we've seen
             if known_sizes:
                 mean = sum(known_sizes) / len(known_sizes)
                 unknown_count = sum(
@@ -592,22 +684,49 @@ class UploadSession:
                     and not (it.get("zip_size_bytes") or it.get("size_bytes"))
                 )
                 remaining_bytes += int(mean * unknown_count)
-            # speed from recent uploads
-            if self._recent_uploads:
-                total_bytes = sum(b for b, _ in self._recent_uploads)
-                total_time = sum(t for _, t in self._recent_uploads)
-                speed_bps = total_bytes / total_time if total_time > 0 else 0.0
+
+            # Live in-flight transfer
+            with self._current_lock:
+                ct = dict(self._current_transfer)
+            in_flight_bytes = ct.get("bytes_over_wire", 0) or 0
+            in_flight_start = ct.get("start_monotonic")
+            in_flight_name = ct.get("name")
+            in_flight_size = ct.get("size_bytes") or 0
+            # bytes already up (verified) + partial in-flight
+            bytes_uploaded_live = bytes_uploaded + in_flight_bytes
+            # don't double-count the currently-uploading item in remaining
+            remaining_live = max(0, remaining_bytes - in_flight_bytes)
+
+            # Speed: prefer live rate (bytes_over_wire / elapsed of this transfer)
+            # so the UI moves during a long upload; fall back to rolling average
+            # of completed transfers when nothing is in flight.
+            live_speed = 0.0
+            if in_flight_start and in_flight_bytes > 0:
+                elapsed = time.monotonic() - in_flight_start
+                if elapsed > 0:
+                    live_speed = in_flight_bytes / elapsed
+            if live_speed > 0:
+                speed_bps = live_speed
+            elif self._recent_uploads:
+                tb = sum(b for b, _ in self._recent_uploads)
+                tt = sum(t for _, t in self._recent_uploads)
+                speed_bps = tb / tt if tt > 0 else 0.0
             else:
                 speed_bps = 0.0
-            eta_s = (remaining_bytes / speed_bps) if speed_bps > 0 and remaining_bytes > 0 else None
+
+            eta_s = (remaining_live / speed_bps) if speed_bps > 0 and remaining_live > 0 else None
+            display_current = current or (
+                f"{in_flight_name} ({_fmt_bytes(in_flight_bytes)}/{_fmt_bytes(in_flight_size)})"
+                if in_flight_name else ""
+            )
             stats = {
                 "done": done,
                 "total": total,
                 "failed": failed,
                 "remaining": total - done - failed,
-                "current": current,
-                "bytes_uploaded": bytes_uploaded,
-                "remaining_bytes": remaining_bytes,
+                "current": display_current,
+                "bytes_uploaded": bytes_uploaded_live,
+                "remaining_bytes": remaining_live,
                 "speed_bps": speed_bps,
                 "eta_seconds": eta_s,
             }
@@ -616,6 +735,8 @@ class UploadSession:
             pass
 
     def _run(self):
+        ticker = threading.Thread(target=self._ticker, daemon=True)
+        ticker.start()
         try:
             for m, path in self.manifests:
                 self._prepare(m, path)
@@ -643,6 +764,9 @@ class UploadSession:
         except Exception as e:
             self._log(f"FATAL: {e}\n{traceback.format_exc()}")
             self.done_cb(False, str(e))
+        finally:
+            self._done_flag.set()
+            ticker.join(timeout=2)
 
     def _run_one_pass(self):
         """One pass through every manifest. SENSOR manifests get the
@@ -782,9 +906,12 @@ class UploadSession:
             item["attempts"] = attempt
             self._log(f"[upload] {name}: attempt {attempt}/{self.advanced['local_retries']}")
             up_start = time.monotonic()
+            self._start_transfer(name, item.get("zip_size_bytes") or 0)
             try:
-                azcopy_upload_file(zip_path, dest, timeout=timeout, put_md5=True)
+                azcopy_upload_file(zip_path, dest, timeout=timeout, put_md5=True,
+                                   on_progress=self._update_transfer)
             except Exception as e:
+                self._end_transfer()
                 item["last_error"] = f"upload attempt {attempt}: {e}"
                 self._log(f"[upload] {name}: {e}")
                 self._sleep_backoff(attempt)
@@ -803,6 +930,7 @@ class UploadSession:
                 item["last_error"] = None
                 self._record_upload(item.get("zip_size_bytes") or 0,
                                     time.monotonic() - up_start)
+                self._end_transfer()
                 self._log(f"[verify] {name}: OK ({remote_md5})")
                 self._save_both(m, path)
                 self._progress(name)
@@ -811,6 +939,7 @@ class UploadSession:
             self._log(f"[verify] {name}: MISMATCH; retrying")
             self._sleep_backoff(attempt)
         item["status"] = STATUS_FAILED
+        self._end_transfer()
         self._save_both(m, path)
         self._log(f"[upload] {name}: exhausted {self.advanced['local_retries']} local retries; will retry on next session")
 
@@ -842,9 +971,12 @@ class UploadSession:
                 item["attempts"] = attempt
                 self._log(f"[base] {name}: attempt {attempt}/{self.advanced['local_retries']}")
                 up_start = time.monotonic()
+                self._start_transfer(name, item.get("size_bytes") or 0)
                 try:
-                    azcopy_upload_file(src, dest, timeout=timeout, put_md5=True)
+                    azcopy_upload_file(src, dest, timeout=timeout, put_md5=True,
+                                       on_progress=self._update_transfer)
                 except Exception as e:
+                    self._end_transfer()
                     item["last_error"] = f"upload attempt {attempt}: {e}"
                     self._log(f"[base] {name}: {e}")
                     self._sleep_backoff(attempt)
@@ -862,6 +994,7 @@ class UploadSession:
                     item["last_error"] = None
                     self._record_upload(item.get("size_bytes") or 0,
                                         time.monotonic() - up_start)
+                    self._end_transfer()
                     self._log(f"[base] {name}: verified")
                     self._save_both(m, path)
                     self._progress(name)
@@ -870,6 +1003,7 @@ class UploadSession:
                 self._sleep_backoff(attempt)
             else:
                 item["status"] = STATUS_FAILED
+                self._end_transfer()
                 self._save_both(m, path)
 
     # ---- helpers ----
