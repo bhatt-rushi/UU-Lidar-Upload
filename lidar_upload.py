@@ -647,6 +647,15 @@ class UploadSession:
 
     def _update_transfer(self, bytes_over_wire: int):
         with self._current_lock:
+            # Ignore late callbacks that arrive after _end_transfer.
+            if self._current_transfer.get("name") is None:
+                return
+            # azcopy reports raw bytes-over-wire, which on a bad link exceeds
+            # the file size because of internal block retries. Cap at the
+            # known file size so we never display > 100%.
+            size = self._current_transfer.get("size_bytes") or 0
+            if size and bytes_over_wire > size:
+                bytes_over_wire = size
             self._current_transfer["bytes_over_wire"] = bytes_over_wire
 
     def _end_transfer(self):
@@ -736,10 +745,16 @@ class UploadSession:
                 speed_bps = 0.0
 
             eta_s = (remaining_live / speed_bps) if speed_bps > 0 and remaining_live > 0 else None
-            display_current = current or (
-                f"{in_flight_name} ({_fmt_bytes(in_flight_bytes)}/{_fmt_bytes(in_flight_size)})"
-                if in_flight_name else ""
-            )
+            # While a transfer is in flight, show only its name -- top-row
+            # Uploaded / Speed / ETA already carry the numeric progress, and
+            # duplicating "1.7 GB / 1.1 GB" here was confusing when azcopy's
+            # retry-bytes made the counter exceed the file size.
+            if in_flight_name:
+                display_current = f"Uploading: {in_flight_name}"
+            elif current:
+                display_current = f"Last: {current}"
+            else:
+                display_current = ""
             stats = {
                 "done": done,
                 "total": total,
@@ -1344,7 +1359,7 @@ class App(tk.Tk):
             self.eta_var.set(f"ETA: {_fmt_eta(stats['eta_seconds'])}")
             self.bytes_var.set(f"Uploaded: {_fmt_bytes(stats['bytes_uploaded'])}")
             if stats["current"]:
-                self.current_item.set(f"Last: {stats['current']}")
+                self.current_item.set(stats["current"])
         self.after(0, apply)
 
     def _done(self, ok: bool, msg: str):
