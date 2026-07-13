@@ -1085,25 +1085,44 @@ def verify_manifest_for_deletion(m: dict,
     Returns {"ok": bool, "checked": n, "issues": [str, ...]}.
     """
     issues: list[str] = []
+    item_results: dict[str, dict] = {}
     checked = 0
     subdir = DIR_SENSOR_DATA if m["kind"] == KIND_SENSOR else DIR_BASE_STATION
+
+    def _record(name: str, category: str | None, detail: str = ""):
+        item_results[name] = {"category": category, "detail": detail}
+        if category is not None:
+            issues.append(detail)
+
     for name, item in m["items"].items():
         if cancel_event is not None and cancel_event.is_set():
             issues.append("Cancelled before all items were checked.")
             break
         checked += 1
         log(f"  checking {name} ...")
+
         if item.get("status") != STATUS_VERIFIED:
-            issues.append(f"{name}: status is {item.get('status')!r}, not verified")
+            _record(name, "not_verified",
+                    f"{name}: status is {item.get('status')!r}, not verified")
             continue
+
         blob_name = f"{name}.zip" if m["kind"] == KIND_SENSOR else name
         url = blob_url(m["client"], m["program"], m["feeder"],
                        subdir, m["collection_date"], blob_name)
         try:
             headers = blob_head(url)
-        except Exception as e:
-            issues.append(f"{name}: blob HEAD failed ({e})")
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                _record(name, "blob_missing",
+                        f"{name}: blob is missing on Azure ({blob_name})")
+            else:
+                _record(name, "blob_error",
+                        f"{name}: blob HEAD failed ({e})")
             continue
+        except Exception as e:
+            _record(name, "blob_error", f"{name}: blob HEAD failed ({e})")
+            continue
+
         remote_md5 = headers.get("content-md5")
         try:
             remote_size = int(headers.get("content-length", "0"))
@@ -1111,42 +1130,86 @@ def verify_manifest_for_deletion(m: dict,
             remote_size = 0
         expected_md5 = item.get("zip_md5_b64") if m["kind"] == KIND_SENSOR else item.get("md5_b64")
         expected_size = item.get("zip_size_bytes") if m["kind"] == KIND_SENSOR else item.get("size_bytes")
+
         if expected_md5 and remote_md5 != expected_md5:
-            issues.append(f"{name}: blob md5 mismatch (blob={remote_md5}, manifest={expected_md5})")
+            _record(name, "blob_mismatch",
+                    f"{name}: blob md5 mismatch (blob={remote_md5}, manifest={expected_md5})")
             continue
         if expected_size and remote_size != expected_size:
-            issues.append(f"{name}: blob size mismatch (blob={remote_size}, manifest={expected_size})")
+            _record(name, "blob_mismatch",
+                    f"{name}: blob size mismatch (blob={remote_size}, manifest={expected_size})")
             continue
 
         local_path = Path(item["original_path"])
         if not local_path.exists():
             # Already deleted -- fine from a "safe to delete" perspective:
             # the blob is proven intact, and there is nothing left locally.
+            _record(name, None)
             continue
 
         if m["kind"] == KIND_SENSOR:
             try:
                 count = sum(1 for _ in local_path.rglob("*") if _.is_file())
             except Exception as e:
-                issues.append(f"{name}: could not count local files ({e})")
+                _record(name, "local_error",
+                        f"{name}: could not count local files ({e})")
                 continue
             if count != item.get("file_count"):
-                issues.append(
-                    f"{name}: local file count changed since upload "
-                    f"(now {count}, was {item.get('file_count')})"
-                )
+                _record(name, "local_mismatch",
+                        f"{name}: local file count changed since upload "
+                        f"(now {count}, was {item.get('file_count')})")
+                continue
         else:
             try:
                 _hex, b64, size = md5_file(local_path)
             except Exception as e:
-                issues.append(f"{name}: could not hash local file ({e})")
+                _record(name, "local_error",
+                        f"{name}: could not hash local file ({e})")
                 continue
             if b64 != expected_md5:
-                issues.append(
-                    f"{name}: local md5 differs from blob md5 "
-                    f"(local={b64}, blob={remote_md5})"
-                )
-    return {"ok": len(issues) == 0, "checked": checked, "issues": issues}
+                _record(name, "local_mismatch",
+                        f"{name}: local md5 differs from blob md5 "
+                        f"(local={b64}, blob={remote_md5})")
+                continue
+
+        _record(name, None)
+    return {
+        "ok": len(issues) == 0,
+        "checked": checked,
+        "issues": issues,
+        "item_results": item_results,
+    }
+
+
+# Categories that mean "the cloud copy is bad, and we can fix it by
+# re-uploading the item". Anything else (local drift, not-verified,
+# transient HEAD errors) is not auto-repairable here.
+REPAIRABLE_CATEGORIES = {"blob_missing", "blob_mismatch"}
+
+
+def repair_manifest_for_reupload(m: dict, local_path: Path,
+                                  item_results: dict[str, dict]) -> list[str]:
+    """Reset items whose blob copy was found missing / mismatched back to
+    STATUS_PENDING so the next Resume picks them up and re-uploads them.
+
+    Returns the list of item names that were repaired.
+    """
+    repaired: list[str] = []
+    for name, res in item_results.items():
+        if res.get("category") not in REPAIRABLE_CATEGORIES:
+            continue
+        item = m["items"].get(name)
+        if not item:
+            continue
+        item["status"] = STATUS_PENDING
+        item["attempts"] = 0
+        item["uploaded_utc"] = None
+        item["last_error"] = f"Repaired by validation: {res.get('detail', res.get('category'))}"
+        repaired.append(name)
+    if repaired:
+        save_cloud_manifest(m)
+        save_local_manifest(m, local_path)
+    return repaired
 
 
 def _fmt_bytes(n: int) -> str:
@@ -1255,7 +1318,7 @@ class App(tk.Tk):
                    command=self._start_new_wizard).pack(pady=6)
         ttk.Button(frame, text="Resume from manifest...", width=30,
                    command=self._start_resume).pack(pady=6)
-        ttk.Button(frame, text="Am I Good To Delete?", width=30,
+        ttk.Button(frame, text="Am I Good To Delete? / Validate cloud", width=30,
                    command=self._open_deletion_check).pack(pady=6)
         ttk.Button(frame, text="Advanced options...", width=30,
                    command=self._open_advanced).pack(pady=6)
@@ -1738,6 +1801,9 @@ class DeletionCheckDialog(tk.Toplevel):
         self._paths: list[Path] = []
         self._manifests: dict[str, dict] = {}  # path -> manifest
         self._cancel = threading.Event()
+        # Last verify result kept so Repair can act on it without re-running.
+        self._last_result: dict | None = None
+        self._last_result_path: Path | None = None
 
         top = ttk.Frame(self, padding=8)
         top.pack(fill="x")
@@ -1771,6 +1837,10 @@ class DeletionCheckDialog(tk.Toplevel):
         self.stop_btn = ttk.Button(btns, text="Stop check", command=self._cancel.set)
         self.stop_btn.pack(side="left", padx=6)
         self.stop_btn.state(["disabled"])
+        self.repair_btn = ttk.Button(btns, text="Repair manifest for re-upload",
+                                     command=self._repair)
+        self.repair_btn.pack(side="left", padx=6)
+        self.repair_btn.state(["disabled"])
         ttk.Button(btns, text="Close", command=self.destroy).pack(side="right")
 
         result_frame = ttk.LabelFrame(self, text="Result")
@@ -1842,6 +1912,9 @@ class DeletionCheckDialog(tk.Toplevel):
         self.verdict_var.set("Verifying against blob... please wait.")
         self._cancel.clear()
         self.stop_btn.state(["!disabled"])
+        self.repair_btn.state(["disabled"])
+        self._last_result = None
+        self._last_result_path = path
         threading.Thread(target=self._verify_worker, args=(m, path), daemon=True).start()
 
     def _verify_worker(self, m: dict, path: Path):
@@ -1861,6 +1934,7 @@ class DeletionCheckDialog(tk.Toplevel):
 
         def finish():
             self.stop_btn.state(["disabled"])
+            self._last_result = result
             if self._cancel.is_set():
                 self.verdict_var.set("Cancelled.")
             elif result["ok"]:
@@ -1874,8 +1948,82 @@ class DeletionCheckDialog(tk.Toplevel):
                 )
                 for issue in result["issues"]:
                     self._append(f"  !! {issue}\n")
+            # If any items are repairable (blob missing/mismatched), enable
+            # the Repair button so the pilot can reset them to pending
+            # and re-upload.
+            repairable = [
+                n for n, r in (result.get("item_results") or {}).items()
+                if r.get("category") in REPAIRABLE_CATEGORIES
+            ]
+            if repairable:
+                self.repair_btn.config(text=f"Repair manifest ({len(repairable)} to re-upload)")
+                self.repair_btn.state(["!disabled"])
+                self._append(
+                    f"\n{len(repairable)} item(s) can be repaired (blob missing or "
+                    f"mismatched). Click 'Repair manifest' to mark them for re-upload, "
+                    f"then use Resume to send them again.\n"
+                )
+            else:
+                self.repair_btn.config(text="Repair manifest for re-upload")
+                self.repair_btn.state(["disabled"])
             self._append(f"\nManifest file: {path}\n")
         self.after(0, finish)
+
+    def _repair(self):
+        if not self._last_result or not self._last_result_path:
+            messagebox.showerror("No result", "Run 'Verify selected' first.")
+            return
+        path = self._last_result_path
+        m = self._manifests.get(str(path))
+        if not m:
+            messagebox.showerror("Load failed", "Could not read that manifest.")
+            return
+        item_results = self._last_result.get("item_results") or {}
+        repairable = [n for n, r in item_results.items()
+                      if r.get("category") in REPAIRABLE_CATEGORIES]
+        if not repairable:
+            messagebox.showinfo("Nothing to repair",
+                                "No repairable items in the last check result.")
+            return
+        if not messagebox.askyesno(
+            "Confirm repair",
+            f"Mark {len(repairable)} item(s) as pending so they will be re-uploaded "
+            f"the next time you Resume this manifest?\n\n"
+            + "\n".join(f"  - {n}" for n in repairable[:10])
+            + ("\n  ..." if len(repairable) > 10 else "")
+        ):
+            return
+        self.repair_btn.state(["disabled"])
+        self.verdict_var.set("Repairing manifest...")
+
+        def worker():
+            try:
+                names = repair_manifest_for_reupload(m, path, item_results)
+            except Exception as e:
+                self.after(0, lambda: messagebox.showerror("Repair failed", str(e)))
+                return
+            def done():
+                self._append(f"\nRepaired {len(names)} item(s); reset to pending:\n")
+                for n in names:
+                    self._append(f"  * {n}\n")
+                self.verdict_var.set(
+                    f"Manifest repaired. Resume this manifest to re-upload "
+                    f"{len(names)} item(s)."
+                )
+                # Refresh the cached manifest so the tree row shows the new
+                # verified/total split.
+                try:
+                    self._manifests[str(path)] = load_local_manifest(path)
+                except Exception:
+                    pass
+                self._refill()
+                # Clear the last result so the button won't be re-enabled without
+                # another Verify pass.
+                self._last_result = None
+                self.repair_btn.config(text="Repair manifest for re-upload")
+            self.after(0, done)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _append(self, s: str):
         self.result_text.insert("end", s)
