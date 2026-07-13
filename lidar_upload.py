@@ -532,10 +532,31 @@ def load_local_manifest(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def default_local_path(scratch: Path, feeder: str, kind: str, collection_date: str) -> Path:
+def registry_dir() -> Path:
+    """Well-known local directory where every manifest this tool has ever
+    written lives, so pilots can find them all from one place.
+
+    On Windows: %LOCALAPPDATA%\\UULidarUpload\\manifests\\
+    Elsewhere: <script_dir>/manifests/
+    """
+    if os.name == "nt":
+        base = Path(os.environ.get("LOCALAPPDATA") or tempfile.gettempdir())
+        d = base / "UULidarUpload" / "manifests"
+    else:
+        d = script_dir() / "manifests"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def list_registered_manifests() -> list[Path]:
+    return sorted(registry_dir().glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def default_local_path(feeder: str, kind: str, collection_date: str, session_id: str) -> Path:
     stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     subdir = "sensor" if kind == KIND_SENSOR else "base"
-    return scratch / f"manifest_{feeder}_{subdir}_{collection_date}_{stamp}.json"
+    sid = (session_id or "")[:8] or "nosid"
+    return registry_dir() / f"manifest_{feeder}_{subdir}_{collection_date}_{stamp}_{sid}.json"
 
 
 def merge_cloud_into(local: dict, cloud: dict) -> dict:
@@ -1025,6 +1046,94 @@ class UploadSession:
         save_local_manifest(m, path)
 
 
+def verify_manifest_for_deletion(m: dict,
+                                  log,
+                                  cancel_event: threading.Event | None = None) -> dict:
+    """Cross-check every item in a manifest against the blob so the pilot can
+    confirm it is safe to delete the local source data.
+
+    Sensor items (folders zipped for upload):
+      - status must be VERIFIED
+      - blob HEAD must exist; blob Content-MD5 and Content-Length must match
+        what the manifest recorded at upload time
+      - if the local source folder still exists, its recursive file count
+        must match the count recorded in the manifest (proxy for "no one
+        modified the folder since upload"; re-zipping+re-hashing every
+        mission would be prohibitively slow)
+
+    Base station items (single files):
+      - status must be VERIFIED
+      - blob HEAD must match manifest md5/size
+      - if the local file still exists, its md5 is recomputed and compared
+        against the manifest md5 (cheap and definitive for single files)
+
+    Returns {"ok": bool, "checked": n, "issues": [str, ...]}.
+    """
+    issues: list[str] = []
+    checked = 0
+    subdir = DIR_SENSOR_DATA if m["kind"] == KIND_SENSOR else DIR_BASE_STATION
+    for name, item in m["items"].items():
+        if cancel_event is not None and cancel_event.is_set():
+            issues.append("Cancelled before all items were checked.")
+            break
+        checked += 1
+        log(f"  checking {name} ...")
+        if item.get("status") != STATUS_VERIFIED:
+            issues.append(f"{name}: status is {item.get('status')!r}, not verified")
+            continue
+        blob_name = f"{name}.zip" if m["kind"] == KIND_SENSOR else name
+        url = blob_url(m["client"], m["program"], m["feeder"],
+                       subdir, m["collection_date"], blob_name)
+        try:
+            headers = blob_head(url)
+        except Exception as e:
+            issues.append(f"{name}: blob HEAD failed ({e})")
+            continue
+        remote_md5 = headers.get("content-md5")
+        try:
+            remote_size = int(headers.get("content-length", "0"))
+        except ValueError:
+            remote_size = 0
+        expected_md5 = item.get("zip_md5_b64") if m["kind"] == KIND_SENSOR else item.get("md5_b64")
+        expected_size = item.get("zip_size_bytes") if m["kind"] == KIND_SENSOR else item.get("size_bytes")
+        if expected_md5 and remote_md5 != expected_md5:
+            issues.append(f"{name}: blob md5 mismatch (blob={remote_md5}, manifest={expected_md5})")
+            continue
+        if expected_size and remote_size != expected_size:
+            issues.append(f"{name}: blob size mismatch (blob={remote_size}, manifest={expected_size})")
+            continue
+
+        local_path = Path(item["original_path"])
+        if not local_path.exists():
+            # Already deleted -- fine from a "safe to delete" perspective:
+            # the blob is proven intact, and there is nothing left locally.
+            continue
+
+        if m["kind"] == KIND_SENSOR:
+            try:
+                count = sum(1 for _ in local_path.rglob("*") if _.is_file())
+            except Exception as e:
+                issues.append(f"{name}: could not count local files ({e})")
+                continue
+            if count != item.get("file_count"):
+                issues.append(
+                    f"{name}: local file count changed since upload "
+                    f"(now {count}, was {item.get('file_count')})"
+                )
+        else:
+            try:
+                _hex, b64, size = md5_file(local_path)
+            except Exception as e:
+                issues.append(f"{name}: could not hash local file ({e})")
+                continue
+            if b64 != expected_md5:
+                issues.append(
+                    f"{name}: local md5 differs from blob md5 "
+                    f"(local={b64}, blob={remote_md5})"
+                )
+    return {"ok": len(issues) == 0, "checked": checked, "issues": issues}
+
+
 def _fmt_bytes(n: int) -> str:
     if n <= 0:
         return "0 B"
@@ -1131,12 +1240,17 @@ class App(tk.Tk):
                    command=self._start_new_wizard).pack(pady=6)
         ttk.Button(frame, text="Resume from manifest...", width=30,
                    command=self._start_resume).pack(pady=6)
+        ttk.Button(frame, text="Am I Good To Delete?", width=30,
+                   command=self._open_deletion_check).pack(pady=6)
         ttk.Button(frame, text="Advanced options...", width=30,
                    command=self._open_advanced).pack(pady=6)
         ttk.Button(frame, text="Exit", width=30, command=self.destroy).pack(pady=6)
 
     def _open_advanced(self):
         AdvancedDialog(self, self.advanced)
+
+    def _open_deletion_check(self):
+        DeletionCheckDialog(self)
 
     def _start_new_wizard(self):
         NewUploadWizard(self, on_ready=self._start_session)
@@ -1527,9 +1641,6 @@ class NewUploadWizard(tk.Toplevel):
             except Exception as e:
                 self._report(f"WARNING: failed to write READMEs: {e}")
 
-        scratch = Path(adv.get("zip_scratch_dir") or tempfile.gettempdir()) / "lidar_upload_scratch"
-        scratch.mkdir(parents=True, exist_ok=True)
-
         manifests: list[tuple[dict, Path]] = []
 
         # Build one SENSOR manifest per date.
@@ -1549,7 +1660,7 @@ class NewUploadWizard(tk.Toplevel):
                     file_count=it.get("file_count", 0),
                     system_name=system_name,
                 )
-            path = default_local_path(scratch, feeder, KIND_SENSOR, date)
+            path = default_local_path(feeder, KIND_SENSOR, date, m["session_id"])
             save_local_manifest(m, path)
             manifests.append((m, path))
             self._report(f"Wrote local manifest: {path}")
@@ -1569,19 +1680,191 @@ class NewUploadWizard(tk.Toplevel):
             for p in bi["files"]:
                 pp = Path(p)
                 m["items"][pp.name] = mint_base_item(str(pp), system_name)
-            path = default_local_path(scratch, feeder, KIND_BASE, bi["date"])
+            path = default_local_path(feeder, KIND_BASE, bi["date"], m["session_id"])
             save_local_manifest(m, path)
             manifests.append((m, path))
             self._report(f"Wrote local manifest: {path}")
 
         messagebox.showinfo(
             "Manifests saved",
-            "Local manifests saved to the scratch dir. Keep them! Any one of them "
-            "is a valid resume handle. The cloud copy at each manifest_blob_path is "
+            f"Local manifests saved to:\n{registry_dir()}\n\n"
+            "Any manifest in that folder is a valid resume handle, and can be "
+            "checked later via 'Am I Good To Delete?' before you delete data "
+            "off the drive. The cloud copy at each manifest_blob_path is "
             "byte-identical to the local file and is also a valid resume handle.",
         )
         self.destroy()
         self.on_ready(manifests)
+
+
+# --- "Am I Good To Delete?" dialog -------------------------------------------
+
+
+class DeletionCheckDialog(tk.Toplevel):
+    """Browse the manifest registry, filter to the one you want, and
+    cross-check every item against the blob before deleting local data.
+    """
+
+    COLUMNS = ("feeder", "kind", "date", "pilot", "verified", "updated")
+
+    def __init__(self, parent: App):
+        super().__init__(parent)
+        self.title("Am I Good To Delete?")
+        self.geometry("1000x680")
+
+        # Modal-on-top
+        self.transient(parent)
+        self.lift()
+        self.attributes("-topmost", True)
+        self.after(300, lambda: self.attributes("-topmost", False))
+        self.focus_force()
+        self.grab_set()
+
+        self._paths: list[Path] = []
+        self._manifests: dict[str, dict] = {}  # path -> manifest
+        self._cancel = threading.Event()
+
+        top = ttk.Frame(self, padding=8)
+        top.pack(fill="x")
+        ttk.Label(top, text=f"Manifest registry:  {registry_dir()}").pack(anchor="w")
+
+        search = ttk.Frame(self, padding=(8, 4))
+        search.pack(fill="x")
+        ttk.Label(search, text="Search (feeder / date / pilot / kind):").pack(side="left")
+        self.search_var = tk.StringVar()
+        self.search_var.trace_add("write", lambda *_: self._refill())
+        ttk.Entry(search, textvariable=self.search_var, width=40).pack(side="left", padx=6)
+        ttk.Button(search, text="Refresh", command=self._reload).pack(side="left", padx=4)
+        ttk.Button(search, text="Open registry folder",
+                   command=self._open_registry_folder).pack(side="left", padx=4)
+
+        tree_frame = ttk.Frame(self)
+        tree_frame.pack(fill="both", expand=True, padx=8, pady=4)
+        self.tree = ttk.Treeview(tree_frame, columns=self.COLUMNS, show="headings",
+                                 selectmode="browse", height=12)
+        for col, w in zip(self.COLUMNS, (100, 90, 110, 140, 100, 170)):
+            self.tree.heading(col, text=col.title())
+            self.tree.column(col, width=w, anchor="w")
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        btns = ttk.Frame(self, padding=8)
+        btns.pack(fill="x")
+        ttk.Button(btns, text="Verify selected", command=self._verify).pack(side="left")
+        self.stop_btn = ttk.Button(btns, text="Stop check", command=self._cancel.set)
+        self.stop_btn.pack(side="left", padx=6)
+        self.stop_btn.state(["disabled"])
+        ttk.Button(btns, text="Close", command=self.destroy).pack(side="right")
+
+        result_frame = ttk.LabelFrame(self, text="Result")
+        result_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self.verdict_var = tk.StringVar(value="Pick a manifest and press 'Verify selected'.")
+        ttk.Label(result_frame, textvariable=self.verdict_var, font=("Segoe UI", 12, "bold")).pack(anchor="w", padx=6, pady=4)
+        self.result_text = tk.Text(result_frame, height=12, wrap="word")
+        self.result_text.pack(fill="both", expand=True, padx=6, pady=4)
+
+        self._reload()
+
+    def _reload(self):
+        self._paths = list_registered_manifests()
+        self._manifests.clear()
+        for p in self._paths:
+            try:
+                self._manifests[str(p)] = load_local_manifest(p)
+            except Exception:
+                self._manifests[str(p)] = {}
+        self._refill()
+
+    def _row_matches(self, m: dict, query: str) -> bool:
+        if not query:
+            return True
+        blob = " ".join(str(m.get(k, "")) for k in
+                        ("feeder", "kind", "collection_date", "pilot_name",
+                         "sensor", "data_type", "client", "program")).lower()
+        return query.lower() in blob
+
+    def _refill(self):
+        q = self.search_var.get().strip()
+        for iid in self.tree.get_children():
+            self.tree.delete(iid)
+        for p in self._paths:
+            m = self._manifests.get(str(p), {})
+            if not self._row_matches(m, q):
+                continue
+            summary = m.get("summary", {}) or {}
+            verified = f"{summary.get('verified', 0)} / {summary.get('total', 0)}"
+            self.tree.insert("", "end", iid=str(p), values=(
+                m.get("feeder", "?"),
+                m.get("kind", "?"),
+                m.get("collection_date", "?"),
+                m.get("pilot_name", "?"),
+                verified,
+                m.get("updated_utc", "")[:19].replace("T", " "),
+            ))
+
+    def _open_registry_folder(self):
+        try:
+            if os.name == "nt":
+                os.startfile(str(registry_dir()))  # type: ignore[attr-defined]
+            else:
+                subprocess.Popen(["xdg-open", str(registry_dir())])
+        except Exception as e:
+            messagebox.showerror("Could not open folder", str(e))
+
+    def _verify(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showerror("Pick one", "Select a manifest row first.")
+            return
+        path = Path(sel[0])
+        m = self._manifests.get(str(path))
+        if not m:
+            messagebox.showerror("Load failed", "Could not read that manifest.")
+            return
+        self.result_text.delete("1.0", "end")
+        self.verdict_var.set("Verifying against blob... please wait.")
+        self._cancel.clear()
+        self.stop_btn.state(["!disabled"])
+        threading.Thread(target=self._verify_worker, args=(m, path), daemon=True).start()
+
+    def _verify_worker(self, m: dict, path: Path):
+        def log(msg: str):
+            self.after(0, lambda: self._append(msg))
+        try:
+            self.after(0, lambda: self._append(
+                f"Checking {len(m.get('items', {}))} item(s) in "
+                f"{m.get('feeder')} / {m.get('kind')} / {m.get('collection_date')} ...\n"
+            ))
+            result = verify_manifest_for_deletion(m, log, self._cancel)
+        except Exception as e:
+            self.after(0, lambda: self._append(f"\nERROR: {e}\n"))
+            self.after(0, lambda: self.verdict_var.set("Check failed."))
+            self.after(0, lambda: self.stop_btn.state(["disabled"]))
+            return
+
+        def finish():
+            self.stop_btn.state(["disabled"])
+            if self._cancel.is_set():
+                self.verdict_var.set("Cancelled.")
+            elif result["ok"]:
+                self.verdict_var.set(
+                    f"SAFE TO DELETE  --  all {result['checked']} item(s) verified against the blob."
+                )
+            else:
+                self.verdict_var.set(
+                    f"NOT SAFE  --  {len(result['issues'])} issue(s) found across "
+                    f"{result['checked']} checked item(s). See details below."
+                )
+                for issue in result["issues"]:
+                    self._append(f"  !! {issue}\n")
+            self._append(f"\nManifest file: {path}\n")
+        self.after(0, finish)
+
+    def _append(self, s: str):
+        self.result_text.insert("end", s)
+        self.result_text.see("end")
 
 
 # --- drive remap dialog ------------------------------------------------------
