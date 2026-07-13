@@ -111,8 +111,7 @@ BASE_STATION_INDEX_NAMES = {"latest_index", "latest_index.txt"}
 PROCESSED_EXTS = {".las", ".laz"}
 
 DEFAULT_ADVANCED = {
-    "local_retries": 3,          # X: per-item local retries within a session
-    "global_retries": 2,         # Y: global retries per item across sessions
+    "local_retries": 3,          # X: per-item retries within a single session
     "timeout_seconds": 3600,     # T: azcopy per-call timeout
     "create_readmes": CREATE_DIR_READMES_DEFAULT,
     "zip_scratch_dir": "",       # "" -> system temp
@@ -408,7 +407,7 @@ def new_manifest(kind: str,
         "manifest_blob_path": manifest_blob_path_for(kind, client, program, feeder, collection_date),
         "created_utc": now,
         "updated_utc": now,
-        # items: name -> {status, attempts, global_attempts, ...} (see mint_* below)
+        # items: name -> {status, attempts, ...} (see mint_* below)
         "items": {},
         "summary": {"total": 0, "verified": 0},
     }
@@ -423,7 +422,6 @@ def mint_sensor_item(source_path: str, file_count: int, system_name: str) -> dic
         "disk_name": get_disk_name(Path(source_path)),
         "status": STATUS_PENDING,
         "attempts": 0,
-        "global_attempts": 0,
         "zip_md5_b64": None,
         "zip_size_bytes": None,
         "uploaded_utc": None,
@@ -439,7 +437,6 @@ def mint_base_item(source_path: str, system_name: str) -> dict:
         "disk_name": get_disk_name(Path(source_path)),
         "status": STATUS_PENDING,
         "attempts": 0,
-        "global_attempts": 0,
         "md5_b64": None,
         "size_bytes": None,
         "uploaded_utc": None,
@@ -494,7 +491,7 @@ def merge_cloud_into(local: dict, cloud: dict) -> dict:
         citem = cloud.get("items", {}).get(name)
         if not citem:
             continue
-        for k in ("status", "global_attempts", "zip_md5_b64", "zip_size_bytes",
+        for k in ("status", "zip_md5_b64", "zip_size_bytes",
                   "md5_b64", "size_bytes", "uploaded_utc", "last_error"):
             if k in citem and citem[k] is not None:
                 litem[k] = citem[k]
@@ -576,9 +573,7 @@ class UploadSession:
                         bytes_uploaded += size
                         known_sizes.append(size)
                     else:
-                        # count pending failures too but only "failed" if global
-                        # retries are exhausted -- otherwise it will be retried
-                        if status == STATUS_FAILED and it.get("global_attempts", 0) >= self.advanced["global_retries"]:
+                        if status == STATUS_FAILED:
                             failed += 1
                         if size:
                             remaining_bytes += size
@@ -654,11 +649,13 @@ class UploadSession:
         else:
             self._log("  no existing cloud manifest, creating fresh")
 
-        # Any item mid-flight -> reset to pending and bump global_attempts.
+        # Any item that was mid-flight or failed previously -> reset to pending
+        # so this session gets a fresh X-attempt budget for it. There's no
+        # global cap, so items are retried indefinitely across sessions until
+        # they verify or the pilot removes them from the manifest.
         for it in local["items"].values():
             if it.get("status") in (STATUS_ZIPPING, STATUS_UPLOADING,
                                      STATUS_UPLOADED, STATUS_FAILED):
-                it["global_attempts"] = it.get("global_attempts", 0) + 1
                 it["attempts"] = 0
                 it["status"] = STATUS_PENDING
 
@@ -680,9 +677,6 @@ class UploadSession:
                     if self._stop.is_set():
                         return
                     if item["status"] == STATUS_VERIFIED:
-                        continue
-                    if item.get("global_attempts", 0) >= self.advanced["global_retries"]:
-                        self._log(f"[zip] {name}: global retries exhausted, skipping")
                         continue
                     src = Path(item["original_path"])
                     if not src.exists():
@@ -765,9 +759,8 @@ class UploadSession:
             self._log(f"[verify] {name}: MISMATCH; retrying")
             self._sleep_backoff(attempt)
         item["status"] = STATUS_FAILED
-        item["global_attempts"] = item.get("global_attempts", 0) + 1
         self._save_both(m, path)
-        self._log(f"[upload] {name}: exhausted local retries. Global attempts={item['global_attempts']}")
+        self._log(f"[upload] {name}: exhausted {self.advanced['local_retries']} local retries; will retry on next session")
 
     # ---- base station ----
 
@@ -825,7 +818,6 @@ class UploadSession:
                 self._sleep_backoff(attempt)
             else:
                 item["status"] = STATUS_FAILED
-                item["global_attempts"] = item.get("global_attempts", 0) + 1
                 self._save_both(m, path)
 
     # ---- helpers ----
@@ -1080,7 +1072,6 @@ class AdvancedDialog(tk.Toplevel):
         vars_ = {}
         rows = [
             ("Local retries per item (X)", "local_retries", int),
-            ("Global retries per item (Y)", "global_retries", int),
             ("azcopy per-call timeout seconds (T)", "timeout_seconds", int),
             ("Zip scratch dir (blank = temp)", "zip_scratch_dir", str),
         ]

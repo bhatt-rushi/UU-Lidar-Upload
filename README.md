@@ -52,8 +52,9 @@ Currently supported:
 
 ## Advanced options
 
-- Local retries (X) per mission per session
-- Global retries (Y) across sessions (auto-skips after limit)
+- Local retries (X) per mission per session (missions that exhaust
+  X retries stay in the manifest and will be retried on the next
+  session; there is no permanent give-up cap)
 - azcopy per-call timeout (T seconds)
 - Zip scratch directory (blank = system temp)
 - Whether to write tiny `README.txt` placeholders so empty feeder
