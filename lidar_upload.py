@@ -892,6 +892,16 @@ class UploadSession:
                         continue
                     src = Path(item["original_path"])
                     if not src.exists():
+                        # Multi-pilot / split-across-SD scenario: this item was
+                        # added by another system. We can't upload it from
+                        # here; leave it alone so the owning system can
+                        # complete it later, rather than marking it FAILED
+                        # (which would burn a slot in the forever-retry loop).
+                        owner = item.get("system_name") or ""
+                        if owner and owner != get_system_name():
+                            self._log(f"[zip] {name}: owned by other system "
+                                      f"({owner}); leaving alone")
+                            continue
                         self._log(f"[zip] {name}: source missing: {src}")
                         item["status"] = STATUS_FAILED
                         item["last_error"] = f"source path missing: {src}"
@@ -991,6 +1001,11 @@ class UploadSession:
                 continue
             src = Path(item["original_path"])
             if not src.exists():
+                owner = item.get("system_name") or ""
+                if owner and owner != get_system_name():
+                    self._log(f"[base] {name}: owned by other system "
+                              f"({owner}); leaving alone")
+                    continue
                 self._log(f"[base] {name}: missing source: {src}")
                 item["status"] = STATUS_FAILED
                 item["last_error"] = f"source missing: {src}"
@@ -1346,25 +1361,14 @@ class App(tk.Tk):
         session.start()
 
     def _start_resume(self):
-        path = filedialog.askopenfilename(
-            title="Select manifest.json (local file or one you downloaded from blob)",
-            filetypes=[("JSON", "*.json"), ("All files", "*.*")],
-        )
-        if not path:
-            return
-        try:
-            m = load_local_manifest(Path(path))
-        except Exception as e:
-            messagebox.showerror("Load failed", str(e))
-            return
-        if m.get("version") != MANIFEST_VERSION:
-            messagebox.showerror("Bad manifest", f"Unsupported manifest version: {m.get('version')}")
-            return
+        ResumeDialog(self, on_pick=self._on_resume_picked)
+
+    def _on_resume_picked(self, m: dict, path: Path):
         remapped = DriveRemapDialog(self, m).result
         if remapped is False:
             return
-        save_local_manifest(m, Path(path))
-        self._start_session([(m, Path(path))])
+        save_local_manifest(m, path)
+        self._start_session([(m, path)])
 
     # --- progress screen ---
 
@@ -1679,6 +1683,22 @@ class NewUploadWizard(tk.Toplevel):
             messagebox.showerror("Nothing to do", "Enable at least one of SENSOR_DATA or BASE_STATION.")
             return
 
+        # Preview any existing cloud manifests so the pilot knows what will be
+        # merged versus added. Multi-pilot or split-across-SD-cards scenarios
+        # always merge into the existing per-(feeder,kind,date) cloud manifest.
+        client = self.client_var.get()
+        program = self.program_var.get()
+        my_system = get_system_name()
+        for date, items in sorted(sensor_by_date.items()):
+            real_date = items[0]["date"] if date == "__processed__" else date
+            self._preview_cloud_merge(KIND_SENSOR, client, program, feeder, real_date,
+                                      new_names={it["name"] for it in items},
+                                      my_system=my_system)
+        if base_info:
+            self._preview_cloud_merge(KIND_BASE, client, program, feeder, base_info["date"],
+                                      new_names={Path(p).name for p in base_info["files"]},
+                                      my_system=my_system)
+
         self.scanned = {
             "feeder": feeder,
             "data_type": data_type,
@@ -1686,6 +1706,47 @@ class NewUploadWizard(tk.Toplevel):
             "base_info": base_info,
         }
         self._report("Scan OK. Press 'Start upload' to begin.")
+
+    def _preview_cloud_merge(self, kind: str, client: str, program: str,
+                              feeder: str, collection_date: str,
+                              new_names: set[str], my_system: str):
+        """Fetch any existing cloud manifest and report how the merge will
+        look, so the pilot knows what they're adding to before pressing Start.
+        Failure to reach Azure is non-fatal; we log a warning and move on."""
+        try:
+            existing = load_cloud_manifest_at(
+                manifest_blob_path_for(kind, client, program, feeder, collection_date))
+        except Exception as e:
+            self._report(f"[cloud] {kind}/{collection_date}: could not check cloud "
+                         f"for existing manifest ({e}); will attempt merge at Start.")
+            return
+        if not existing:
+            self._report(f"[cloud] {kind}/{collection_date}: no existing cloud manifest; "
+                         f"a fresh one will be created.")
+            return
+        existing_items = existing.get("items", {}) or {}
+        verified = sum(1 for it in existing_items.values() if it.get("status") == STATUS_VERIFIED)
+        pending = len(existing_items) - verified
+        same_name = new_names & set(existing_items.keys())
+        truly_new = new_names - same_name
+        other_system_items = [
+            n for n, it in existing_items.items()
+            if it.get("system_name") and it.get("system_name") != my_system
+        ]
+        self._report(
+            f"[cloud] {kind}/{collection_date}: existing manifest has "
+            f"{len(existing_items)} item(s) "
+            f"({verified} verified, {pending} pending).")
+        if same_name:
+            self._report(f"    - {len(same_name)} of your items already exist by name "
+                         f"in the cloud; already-verified ones will be skipped, "
+                         f"any not-yet-verified will re-upload.")
+        if truly_new:
+            self._report(f"    - {len(truly_new)} brand-new item(s) from your scan "
+                         f"will be ADDED to the existing manifest.")
+        if other_system_items:
+            self._report(f"    - {len(other_system_items)} item(s) belong to another "
+                         f"system; those are left alone by this session.")
 
     def _confirm_start(self):
         if not self.scanned:
@@ -2028,6 +2089,140 @@ class DeletionCheckDialog(tk.Toplevel):
     def _append(self, s: str):
         self.result_text.insert("end", s)
         self.result_text.see("end")
+
+
+# --- resume-from-manifest browser -------------------------------------------
+
+
+class ResumeDialog(tk.Toplevel):
+    """Registry browser for the Resume flow. Same searchable table as
+    DeletionCheckDialog, but the primary action is 'Resume selected' which
+    hands the chosen manifest back to the App to start an UploadSession.
+    Also keeps a 'Browse for file...' escape hatch for manifests that live
+    outside the registry (e.g. one the pilot downloaded from the blob)."""
+
+    COLUMNS = ("feeder", "kind", "date", "pilot", "verified", "updated")
+
+    def __init__(self, parent: App, on_pick):
+        super().__init__(parent)
+        self.title("Resume from manifest")
+        self.geometry("1000x560")
+        self.on_pick = on_pick
+
+        self.transient(parent)
+        self.lift()
+        self.attributes("-topmost", True)
+        self.after(300, lambda: self.attributes("-topmost", False))
+        self.focus_force()
+        self.grab_set()
+
+        self._paths: list[Path] = []
+        self._manifests: dict[str, dict] = {}
+
+        top = ttk.Frame(self, padding=8)
+        top.pack(fill="x")
+        ttk.Label(top, text=f"Manifest registry:  {registry_dir()}").pack(anchor="w")
+
+        search = ttk.Frame(self, padding=(8, 4))
+        search.pack(fill="x")
+        ttk.Label(search, text="Search (feeder / date / pilot / kind):").pack(side="left")
+        self.search_var = tk.StringVar()
+        self.search_var.trace_add("write", lambda *_: self._refill())
+        ttk.Entry(search, textvariable=self.search_var, width=40).pack(side="left", padx=6)
+        ttk.Button(search, text="Refresh", command=self._reload).pack(side="left", padx=4)
+
+        tree_frame = ttk.Frame(self)
+        tree_frame.pack(fill="both", expand=True, padx=8, pady=4)
+        self.tree = ttk.Treeview(tree_frame, columns=self.COLUMNS, show="headings",
+                                 selectmode="browse", height=14)
+        for col, w in zip(self.COLUMNS, (100, 90, 110, 140, 100, 170)):
+            self.tree.heading(col, text=col.title())
+            self.tree.column(col, width=w, anchor="w")
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        self.tree.bind("<Double-1>", lambda _e: self._resume_selected())
+
+        btns = ttk.Frame(self, padding=8)
+        btns.pack(fill="x")
+        ttk.Button(btns, text="Resume selected", command=self._resume_selected).pack(side="left")
+        ttk.Button(btns, text="Browse for file...", command=self._browse_file).pack(side="left", padx=6)
+        ttk.Button(btns, text="Cancel", command=self.destroy).pack(side="right")
+
+        self._reload()
+
+    def _reload(self):
+        self._paths = list_registered_manifests()
+        self._manifests.clear()
+        for p in self._paths:
+            try:
+                self._manifests[str(p)] = load_local_manifest(p)
+            except Exception:
+                self._manifests[str(p)] = {}
+        self._refill()
+
+    def _row_matches(self, m: dict, query: str) -> bool:
+        if not query:
+            return True
+        blob = " ".join(str(m.get(k, "")) for k in
+                        ("feeder", "kind", "collection_date", "pilot_name",
+                         "sensor", "data_type", "client", "program")).lower()
+        return query.lower() in blob
+
+    def _refill(self):
+        q = self.search_var.get().strip()
+        for iid in self.tree.get_children():
+            self.tree.delete(iid)
+        for p in self._paths:
+            m = self._manifests.get(str(p), {})
+            if not self._row_matches(m, q):
+                continue
+            summary = m.get("summary", {}) or {}
+            verified = f"{summary.get('verified', 0)} / {summary.get('total', 0)}"
+            self.tree.insert("", "end", iid=str(p), values=(
+                m.get("feeder", "?"),
+                m.get("kind", "?"),
+                m.get("collection_date", "?"),
+                m.get("pilot_name", "?"),
+                verified,
+                m.get("updated_utc", "")[:19].replace("T", " "),
+            ))
+
+    def _resume_selected(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showerror("Pick one", "Select a manifest row first.")
+            return
+        path = Path(sel[0])
+        try:
+            m = load_local_manifest(path)
+        except Exception as e:
+            messagebox.showerror("Load failed", str(e))
+            return
+        self._pick(m, path)
+
+    def _browse_file(self):
+        path = filedialog.askopenfilename(
+            title="Select manifest.json (any manifest, e.g. one downloaded from the blob)",
+            filetypes=[("JSON", "*.json"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            m = load_local_manifest(Path(path))
+        except Exception as e:
+            messagebox.showerror("Load failed", str(e))
+            return
+        self._pick(m, Path(path))
+
+    def _pick(self, m: dict, path: Path):
+        if m.get("version") != MANIFEST_VERSION:
+            messagebox.showerror("Bad manifest",
+                                 f"Unsupported manifest version: {m.get('version')}")
+            return
+        self.destroy()
+        self.on_pick(m, path)
 
 
 # --- drive remap dialog ------------------------------------------------------
