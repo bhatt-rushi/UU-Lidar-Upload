@@ -111,16 +111,16 @@ BASE_STATION_INDEX_NAMES = {"latest_index", "latest_index.txt"}
 PROCESSED_EXTS = {".las", ".laz"}
 
 DEFAULT_ADVANCED = {
-    "local_retries": 3,          # X: per-item retries within a single session
-    "timeout_seconds": 3600,     # T: azcopy per-call timeout
+    "local_retries": 50,          # X: per-item retries within a single session
+    "timeout_seconds": 3600,      # T: azcopy per-call timeout
     "create_readmes": CREATE_DIR_READMES_DEFAULT,
-    "zip_scratch_dir": "",       # "" -> system temp
-    "retry_failed_forever": False,   # after the initial pass, keep retrying
-                                     # any items in status=failed forever,
-                                     # sleeping 5 minutes between passes
+    "zip_scratch_dir": "",        # "" -> system temp
+    "retry_failed_forever": True, # after first pass, keep retrying items
+                                  # left in status=failed forever, sleeping
+                                  # retry_failed_interval_seconds between
+                                  # passes
+    "retry_failed_interval_seconds": 300,
 }
-
-RETRY_FAILED_INTERVAL_SECONDS = 300
 
 STATUS_PENDING = "pending"
 STATUS_ZIPPING = "zipping"
@@ -470,12 +470,18 @@ def new_manifest(kind: str,
     }
 
 
-def mint_sensor_item(source_path: str, file_count: int, system_name: str) -> dict:
+def mint_sensor_item(source_path: str, file_count: int, system_name: str,
+                     pilot_name: str, session_id: str) -> dict:
     return {
         "kind": KIND_SENSOR,
         "original_path": source_path,
         "file_count": file_count,
+        # Owner identity is stamped at mint time and never overwritten by a
+        # merge, so a pilot's session can filter the deletion check to just
+        # the items THEY uploaded even after another pilot has appended.
         "system_name": system_name,
+        "pilot_name": pilot_name,
+        "session_id": session_id,
         "disk_name": get_disk_name(Path(source_path)),
         "status": STATUS_PENDING,
         "attempts": 0,
@@ -486,11 +492,14 @@ def mint_sensor_item(source_path: str, file_count: int, system_name: str) -> dic
     }
 
 
-def mint_base_item(source_path: str, system_name: str) -> dict:
+def mint_base_item(source_path: str, system_name: str,
+                   pilot_name: str, session_id: str) -> dict:
     return {
         "kind": KIND_BASE,
         "original_path": source_path,
         "system_name": system_name,
+        "pilot_name": pilot_name,
+        "session_id": session_id,
         "disk_name": get_disk_name(Path(source_path)),
         "status": STATUS_PENDING,
         "attempts": 0,
@@ -787,9 +796,10 @@ class UploadSession:
                     n_failed = self._count_failed()
                     if n_failed == 0:
                         break
+                    interval = int(self.advanced.get("retry_failed_interval_seconds", 300) or 300)
                     self._log(f"[retry] {n_failed} item(s) still failed; "
-                              f"sleeping {RETRY_FAILED_INTERVAL_SECONDS}s before next pass")
-                    self._sleep_interruptible(RETRY_FAILED_INTERVAL_SECONDS)
+                              f"sleeping {interval}s before next pass")
+                    self._sleep_interruptible(interval)
                     if self._stop.is_set():
                         break
                     n_reset = self._reset_failed_to_pending()
@@ -1078,7 +1088,8 @@ class UploadSession:
 
 def verify_manifest_for_deletion(m: dict,
                                   log,
-                                  cancel_event: threading.Event | None = None) -> dict:
+                                  cancel_event: threading.Event | None = None,
+                                  item_filter=None) -> dict:
     """Cross-check every item in a manifest against the blob so the pilot can
     confirm it is safe to delete the local source data.
 
@@ -1102,6 +1113,7 @@ def verify_manifest_for_deletion(m: dict,
     issues: list[str] = []
     item_results: dict[str, dict] = {}
     checked = 0
+    skipped = 0
     subdir = DIR_SENSOR_DATA if m["kind"] == KIND_SENSOR else DIR_BASE_STATION
 
     def _record(name: str, category: str | None, detail: str = ""):
@@ -1113,6 +1125,9 @@ def verify_manifest_for_deletion(m: dict,
         if cancel_event is not None and cancel_event.is_set():
             issues.append("Cancelled before all items were checked.")
             break
+        if item_filter is not None and not item_filter(item):
+            skipped += 1
+            continue
         checked += 1
         log(f"  checking {name} ...")
 
@@ -1198,6 +1213,7 @@ def verify_manifest_for_deletion(m: dict,
     return {
         "ok": len(issues) == 0,
         "checked": checked,
+        "skipped": skipped,
         "issues": issues,
         "item_results": item_results,
     }
@@ -1410,7 +1426,12 @@ class App(tk.Tk):
 
         btns = ttk.Frame(frame)
         btns.pack(fill="x")
-        ttk.Button(btns, text="Stop", command=self._stop_session).pack(side="right")
+        self.stop_btn = ttk.Button(btns, text="Stop", command=self._stop_session)
+        self.stop_btn.pack(side="right")
+        self.back_btn = ttk.Button(btns, text="Back to home",
+                                   command=self._back_to_home)
+        self.back_btn.pack(side="right", padx=6)
+        self.back_btn.state(["disabled"])
 
     def _log(self, msg: str):
         self.after(0, lambda: self._append_log(msg))
@@ -1439,6 +1460,13 @@ class App(tk.Tk):
     def _done(self, ok: bool, msg: str):
         def apply():
             self._append_log(("DONE: " if ok else "FAILED: ") + msg)
+            # Session is over -- swap the buttons so the pilot can leave.
+            try:
+                self.stop_btn.state(["disabled"])
+                self.stop_btn.config(text="Stopped" if not ok else "Finished")
+                self.back_btn.state(["!disabled"])
+            except Exception:
+                pass
             messagebox.showinfo("Finished" if ok else "Stopped", msg)
         self.after(0, apply)
 
@@ -1446,6 +1474,17 @@ class App(tk.Tk):
         if self.session:
             self.session.stop()
             self._append_log("Stop requested; will halt after current item.")
+
+    def _back_to_home(self):
+        # If a session is somehow still running, ask it to stop before we
+        # tear down the progress UI; the daemon thread will exit on its own.
+        if self.session:
+            try:
+                self.session.stop()
+            except Exception:
+                pass
+            self.session = None
+        self._build_start()
 
 
 # --- advanced options dialog -------------------------------------------------
@@ -1462,6 +1501,7 @@ class AdvancedDialog(tk.Toplevel):
         rows = [
             ("Local retries per item (X)", "local_retries", int),
             ("azcopy per-call timeout seconds (T)", "timeout_seconds", int),
+            ("Retry-failed interval seconds (between passes)", "retry_failed_interval_seconds", int),
             ("Zip scratch dir (blank = temp)", "zip_scratch_dir", str),
         ]
         for i, (label, key, _t) in enumerate(rows):
@@ -1474,10 +1514,10 @@ class AdvancedDialog(tk.Toplevel):
         ttk.Checkbutton(self, text="Create tiny README.txt per feeder subdirectory (so empty dirs persist)",
                         variable=readme_var).grid(row=len(rows), column=0, columnspan=2, sticky="w", padx=8, pady=8)
 
-        retry_var = tk.BooleanVar(value=bool(advanced.get("retry_failed_forever", False)))
+        retry_var = tk.BooleanVar(value=bool(advanced.get("retry_failed_forever", True)))
         ttk.Checkbutton(self,
-                        text=f"After first pass, keep retrying failed uploads forever "
-                             f"({RETRY_FAILED_INTERVAL_SECONDS // 60} min between passes)",
+                        text="After first pass, keep retrying failed uploads forever "
+                             "(uses the interval above)",
                         variable=retry_var).grid(row=len(rows) + 1, column=0, columnspan=2,
                                                  sticky="w", padx=8, pady=(0, 8))
 
@@ -1805,6 +1845,8 @@ class NewUploadWizard(tk.Toplevel):
                     source_path=it["path"],
                     file_count=it.get("file_count", 0),
                     system_name=system_name,
+                    pilot_name=pilot_name,
+                    session_id=m["session_id"],
                 )
             path = default_local_path(feeder, KIND_SENSOR, date, m["session_id"])
             save_local_manifest(m, path)
@@ -1825,7 +1867,12 @@ class NewUploadWizard(tk.Toplevel):
             )
             for p in bi["files"]:
                 pp = Path(p)
-                m["items"][pp.name] = mint_base_item(str(pp), system_name)
+                m["items"][pp.name] = mint_base_item(
+                    source_path=str(pp),
+                    system_name=system_name,
+                    pilot_name=pilot_name,
+                    session_id=m["session_id"],
+                )
             path = default_local_path(feeder, KIND_BASE, bi["date"], m["session_id"])
             save_local_manifest(m, path)
             manifests.append((m, path))
@@ -1886,6 +1933,17 @@ class DeletionCheckDialog(tk.Toplevel):
         ttk.Button(search, text="Refresh", command=self._reload).pack(side="left", padx=4)
         ttk.Button(search, text="Open registry folder",
                    command=self._open_registry_folder).pack(side="left", padx=4)
+
+        # Ownership scope for the check: default to items uploaded by THIS
+        # pilot/session so a multi-pilot merged manifest doesn't flag another
+        # pilot's items as local_missing just because the sources aren't on
+        # this machine.
+        scope = ttk.Frame(self, padding=(8, 0))
+        scope.pack(fill="x")
+        self.only_mine_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(scope,
+                        text="Only check items uploaded by me (my session or my system)",
+                        variable=self.only_mine_var).pack(side="left")
 
         # Optional local-prefix remap so a check can retarget when the pilot
         # renamed / moved the parent directory holding the raw data. This is
@@ -2005,6 +2063,23 @@ class DeletionCheckDialog(tk.Toplevel):
         if old and new:
             _remap_paths(m_check, old, new)
 
+        # Build the ownership filter. An item is "mine" if either its
+        # per-item session_id matches this manifest's top-level session_id
+        # (the strictest form), or (legacy items with no per-item session_id)
+        # its system_name matches. When the checkbox is off we check every
+        # item in the manifest.
+        my_session = m_check.get("session_id")
+        my_system = m_check.get("system_name")
+        only_mine = self.only_mine_var.get()
+
+        def item_filter(item):
+            if not only_mine:
+                return True
+            item_session = item.get("session_id")
+            if item_session and my_session:
+                return item_session == my_session
+            return item.get("system_name") == my_system
+
         self.result_text.delete("1.0", "end")
         self.verdict_var.set("Verifying against blob... please wait.")
         self._cancel.clear()
@@ -2012,17 +2087,18 @@ class DeletionCheckDialog(tk.Toplevel):
         self.repair_btn.state(["disabled"])
         self._last_result = None
         self._last_result_path = path
-        threading.Thread(target=self._verify_worker, args=(m_check, path), daemon=True).start()
+        threading.Thread(target=self._verify_worker,
+                         args=(m_check, path, item_filter), daemon=True).start()
 
-    def _verify_worker(self, m: dict, path: Path):
+    def _verify_worker(self, m: dict, path: Path, item_filter=None):
         def log(msg: str):
             self.after(0, lambda: self._append(msg))
         try:
             self.after(0, lambda: self._append(
-                f"Checking {len(m.get('items', {}))} item(s) in "
-                f"{m.get('feeder')} / {m.get('kind')} / {m.get('collection_date')} ...\n"
+                f"Checking items in {m.get('feeder')} / {m.get('kind')} / "
+                f"{m.get('collection_date')} ...\n"
             ))
-            result = verify_manifest_for_deletion(m, log, self._cancel)
+            result = verify_manifest_for_deletion(m, log, self._cancel, item_filter)
         except Exception as e:
             self.after(0, lambda: self._append(f"\nERROR: {e}\n"))
             self.after(0, lambda: self.verdict_var.set("Check failed."))
@@ -2032,6 +2108,13 @@ class DeletionCheckDialog(tk.Toplevel):
         def finish():
             self.stop_btn.state(["disabled"])
             self._last_result = result
+            skipped = result.get("skipped", 0)
+            if skipped:
+                self._append(
+                    f"(Skipped {skipped} item(s) that belong to other "
+                    f"pilots / systems -- uncheck 'Only check items uploaded "
+                    f"by me' to include them.)\n"
+                )
             item_results = result.get("item_results") or {}
             hard_issues = [
                 n for n, r in item_results.items()
