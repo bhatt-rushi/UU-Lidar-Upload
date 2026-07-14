@@ -1305,15 +1305,29 @@ def _fmt_eta(secs: float | None) -> str:
     return f"{s}s"
 
 
+NO_COMPRESS_EXTS = {".jpg", ".jpeg"}
+
+
 def _make_zip(src_dir: Path, out_path: Path) -> None:
-    """ZIP_STORED (no compression) -- LiDAR files are already binary/compact
-    and we care about throughput on a bad link, not disk savings."""
+    """Zip a mission folder for upload.
+
+    Everything gets DEFLATE at level 9 except already-compressed formats
+    (.jpg / .jpeg), which we ZIP_STORE because re-compressing them just
+    burns CPU without shrinking the payload. On the slow / intermittent
+    links this tool targets, a smaller zip is worth the CPU cost.
+    """
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = out_path.with_suffix(out_path.suffix + ".part")
-    with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
+    with zipfile.ZipFile(tmp, "w", allowZip64=True) as zf:
         for p in sorted(src_dir.rglob("*")):
-            if p.is_file():
-                zf.write(p, arcname=p.relative_to(src_dir.parent).as_posix())
+            if not p.is_file():
+                continue
+            arcname = p.relative_to(src_dir.parent).as_posix()
+            if p.suffix.lower() in NO_COMPRESS_EXTS:
+                zf.write(p, arcname=arcname, compress_type=zipfile.ZIP_STORED)
+            else:
+                zf.write(p, arcname=arcname,
+                         compress_type=zipfile.ZIP_DEFLATED, compresslevel=9)
     tmp.replace(out_path)
 
 
