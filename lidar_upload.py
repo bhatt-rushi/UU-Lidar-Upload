@@ -343,6 +343,15 @@ def azcopy_upload_file(local: Path, dest_url: str, timeout: int,
     _run_azcopy_streaming(args, timeout=timeout, on_progress=on_progress)
 
 
+def azcopy_download_file(src_url: str, local: Path, timeout: int,
+                          on_progress=None) -> None:
+    """Same wrapper, download direction. azcopy accepts (source, destination)
+    with the source being the SAS-signed blob URL."""
+    local.parent.mkdir(parents=True, exist_ok=True)
+    args = ["copy", src_url, str(local), "--log-level=ERROR"]
+    _run_azcopy_streaming(args, timeout=timeout, on_progress=on_progress)
+
+
 # --- blob REST (manifest + verify) -------------------------------------------
 
 
@@ -374,6 +383,65 @@ def blob_put_bytes(url: str, data: bytes, content_type: str = "application/json"
 
 def blob_md5_b64(url: str) -> str | None:
     return blob_head(url).get("content-md5")
+
+
+def _container_list_url(prefix: str, marker: str = "") -> str:
+    """URL for the Azure Blob List Blobs API restricted to one prefix. The
+    SAS token must include list permission (usually sp=...l and srt=c)."""
+    parts = (
+        f"restype=container&comp=list&delimiter=/&prefix="
+        f"{urllib.parse.quote(prefix, safe='/')}"
+    )
+    if marker:
+        parts += f"&marker={urllib.parse.quote(marker)}"
+    sas = SAS_TOKEN.lstrip("?")
+    if sas:
+        parts += "&" + sas
+    return f"{BLOB_URL_BASE}?{parts}"
+
+
+def list_blob_prefixes(prefix: str) -> list[str]:
+    """Return the pseudo-directory names one level under ``prefix`` in the
+    container. Uses the List Blobs API with delimiter='/' so BlobPrefix
+    elements come back for each intermediate 'directory'."""
+    import xml.etree.ElementTree as ET
+
+    if prefix and not prefix.endswith("/"):
+        prefix = prefix + "/"
+    out: list[str] = []
+    marker = ""
+    while True:
+        url = _container_list_url(prefix, marker)
+        with urllib.request.urlopen(url, timeout=60) as r:
+            xml = r.read().decode("utf-8")
+        root = ET.fromstring(xml)
+        for bp in root.findall(".//Blobs/BlobPrefix/Name"):
+            name = bp.text or ""
+            if name.startswith(prefix):
+                sub = name[len(prefix):].rstrip("/")
+                if sub:
+                    out.append(sub)
+        marker = (root.findtext("NextMarker") or "").strip()
+        if not marker:
+            break
+    return out
+
+
+def discover_dates_for_feeder(client: str, program: str,
+                               feeder: str) -> dict[str, list[str]]:
+    """For a feeder, return {kind -> [YYYY-MM-DD, ...]} discovered under both
+    SENSOR_DATA/ and BASE_STATION/. Only directory-shaped date names are
+    kept, so noise directories are ignored."""
+    date_re = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+    result: dict[str, list[str]] = {KIND_SENSOR: [], KIND_BASE: []}
+    for kind, subdir in ((KIND_SENSOR, DIR_SENSOR_DATA),
+                          (KIND_BASE, DIR_BASE_STATION)):
+        try:
+            dates = list_blob_prefixes(f"{client}/{program}/{feeder}/{subdir}/")
+        except Exception:
+            dates = []
+        result[kind] = sorted(d for d in dates if date_re.match(d))
+    return result
 
 
 # --- validators --------------------------------------------------------------
@@ -1305,6 +1373,255 @@ def _fmt_eta(secs: float | None) -> str:
     return f"{s}s"
 
 
+# =============================================================================
+# Download session
+# =============================================================================
+
+
+class DownloadSession:
+    """Download a set of manifests' VERIFIED items back to local disk.
+
+    For SENSOR items: fetch the zip, md5-verify, then extract into place so
+    the mission folder appears exactly as it was uploaded. For BASE items:
+    fetch the file, md5-verify. Only verified items in the manifest are
+    downloaded -- anything still pending / in-flight is skipped.
+
+    Emits progress via the same stats dict shape as UploadSession, so the
+    App's progress screen can render it without special-casing.
+    """
+
+    def __init__(self,
+                 manifests: list[dict],
+                 destination: Path,
+                 advanced: dict,
+                 log_cb, progress_cb, done_cb):
+        self.manifests = manifests
+        self.destination = destination
+        self.advanced = advanced
+        self.log_cb = log_cb
+        self.progress_cb = progress_cb
+        self.done_cb = done_cb
+        self._stop = threading.Event()
+        self._done_flag = threading.Event()
+        self._current_lock = threading.Lock()
+        self._current_transfer: dict = {
+            "name": None, "size_bytes": 0,
+            "bytes_over_wire": 0, "start_monotonic": None,
+        }
+        self._verified: set[str] = set()
+        self._failed: set[str] = set()
+        self._recent: list[tuple[int, float]] = []
+        self._recent_window = 8
+
+    def start(self):
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def stop(self):
+        self._stop.set()
+
+    # ---- transfer state (mirrors UploadSession) ----
+
+    def _start_transfer(self, name: str, size_bytes: int):
+        with self._current_lock:
+            self._current_transfer = {
+                "name": name, "size_bytes": size_bytes,
+                "bytes_over_wire": 0, "start_monotonic": time.monotonic(),
+            }
+
+    def _update_transfer(self, bytes_over_wire: int):
+        with self._current_lock:
+            if self._current_transfer.get("name") is None:
+                return
+            size = self._current_transfer.get("size_bytes") or 0
+            if size and bytes_over_wire > size:
+                bytes_over_wire = size
+            self._current_transfer["bytes_over_wire"] = bytes_over_wire
+
+    def _end_transfer(self):
+        with self._current_lock:
+            self._current_transfer = {
+                "name": None, "size_bytes": 0,
+                "bytes_over_wire": 0, "start_monotonic": None,
+            }
+
+    def _record(self, size_bytes: int, dur: float):
+        if size_bytes <= 0 or dur <= 0:
+            return
+        self._recent.append((size_bytes, dur))
+        if len(self._recent) > self._recent_window:
+            self._recent.pop(0)
+
+    def _sleep_backoff(self, attempt: int):
+        delay = min(60, 2 ** attempt)
+        for _ in range(delay):
+            if self._stop.is_set():
+                return
+            time.sleep(1)
+
+    def _log(self, msg: str):
+        try:
+            self.log_cb(msg)
+        except Exception:
+            pass
+
+    def _ticker(self):
+        while not self._stop.is_set() and not self._done_flag.is_set():
+            try:
+                self._progress()
+            except Exception:
+                pass
+            time.sleep(0.5)
+
+    def _run(self):
+        ticker = threading.Thread(target=self._ticker, daemon=True)
+        ticker.start()
+        try:
+            for m in self.manifests:
+                if self._stop.is_set():
+                    break
+                self._download_manifest(m)
+            self.done_cb(True, "Download complete.")
+        except Exception as e:
+            self._log(f"FATAL: {e}\n{traceback.format_exc()}")
+            self.done_cb(False, str(e))
+        finally:
+            self._done_flag.set()
+            ticker.join(timeout=2)
+
+    def _download_manifest(self, m: dict):
+        for name, item in m["items"].items():
+            if self._stop.is_set():
+                return
+            if item.get("status") != STATUS_VERIFIED:
+                continue
+            self._download_one(m, name, item)
+
+    def _download_one(self, m: dict, name: str, item: dict):
+        feeder_dir = (self.destination / m["client"] / m["program"] /
+                      m["feeder"])
+        subdir = DIR_SENSOR_DATA if m["kind"] == KIND_SENSOR else DIR_BASE_STATION
+        date_dir = feeder_dir / subdir / m["collection_date"]
+        date_dir.mkdir(parents=True, exist_ok=True)
+
+        if m["kind"] == KIND_SENSOR:
+            blob_name = f"{name}.zip"
+            src_url = blob_url(m["client"], m["program"], m["feeder"],
+                                DIR_SENSOR_DATA, m["collection_date"], blob_name)
+            expected_md5 = item.get("zip_md5_b64")
+            size = item.get("zip_size_bytes") or 0
+            zip_dest = date_dir / blob_name
+        else:
+            src_url = blob_url(m["client"], m["program"], m["feeder"],
+                                DIR_BASE_STATION, m["collection_date"], name)
+            expected_md5 = item.get("md5_b64")
+            size = item.get("size_bytes") or 0
+            zip_dest = date_dir / name
+
+        timeout = self.advanced["timeout_seconds"]
+        for attempt in range(1, self.advanced["local_retries"] + 1):
+            if self._stop.is_set():
+                return
+            self._log(f"[dl] {name}: attempt {attempt}/{self.advanced['local_retries']}")
+            self._start_transfer(name, size)
+            try:
+                t0 = time.monotonic()
+                # azcopy refuses to overwrite by default; nuke any partial
+                # from a prior attempt.
+                try:
+                    zip_dest.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                azcopy_download_file(src_url, zip_dest, timeout=timeout,
+                                     on_progress=self._update_transfer)
+                _hex, got_md5, got_size = md5_file(zip_dest)
+                if expected_md5 and got_md5 != expected_md5:
+                    raise RuntimeError(
+                        f"md5 mismatch after download "
+                        f"(got={got_md5}, expected={expected_md5})"
+                    )
+                if m["kind"] == KIND_SENSOR:
+                    self._log(f"[dl] {name}: verified; extracting")
+                    with zipfile.ZipFile(zip_dest) as zf:
+                        zf.extractall(date_dir)
+                    try:
+                        zip_dest.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                self._record(size, time.monotonic() - t0)
+                self._verified.add(name)
+                self._end_transfer()
+                self._log(f"[dl] {name}: OK")
+                self._progress(name)
+                return
+            except Exception as e:
+                self._log(f"[dl] {name}: attempt {attempt} failed: {e}")
+                self._end_transfer()
+                self._sleep_backoff(attempt)
+        self._failed.add(name)
+        self._log(f"[dl] {name}: exhausted retries")
+        self._progress(name)
+
+    def _progress(self, current: str = ""):
+        try:
+            total = 0
+            done = len(self._verified)
+            failed = len(self._failed)
+            bytes_done = 0
+            remaining_bytes = 0
+            for m in self.manifests:
+                for name, item in m["items"].items():
+                    if item.get("status") != STATUS_VERIFIED:
+                        continue
+                    total += 1
+                    size = item.get("zip_size_bytes") or item.get("size_bytes") or 0
+                    if name in self._verified:
+                        bytes_done += size
+                    elif name not in self._failed and size:
+                        remaining_bytes += size
+
+            with self._current_lock:
+                ct = dict(self._current_transfer)
+            in_flight_bytes = ct.get("bytes_over_wire") or 0
+            in_flight_start = ct.get("start_monotonic")
+            in_flight_name = ct.get("name")
+            bytes_done_live = bytes_done + in_flight_bytes
+            remaining_live = max(0, remaining_bytes - in_flight_bytes)
+
+            live_speed = 0.0
+            if in_flight_start and in_flight_bytes > 0:
+                elapsed = time.monotonic() - in_flight_start
+                if elapsed > 0:
+                    live_speed = in_flight_bytes / elapsed
+            if live_speed > 0:
+                speed_bps = live_speed
+            elif self._recent:
+                tb = sum(b for b, _ in self._recent)
+                tt = sum(t for _, t in self._recent)
+                speed_bps = tb / tt if tt > 0 else 0.0
+            else:
+                speed_bps = 0.0
+            eta_s = (remaining_live / speed_bps) if speed_bps > 0 and remaining_live > 0 else None
+
+            if in_flight_name:
+                display = f"Downloading: {in_flight_name}"
+            elif current:
+                display = f"Last: {current}"
+            else:
+                display = ""
+
+            self.progress_cb({
+                "done": done, "total": total, "failed": failed,
+                "remaining": total - done - failed,
+                "current": display,
+                "bytes_uploaded": bytes_done_live,
+                "remaining_bytes": remaining_live,
+                "speed_bps": speed_bps,
+                "eta_seconds": eta_s,
+            })
+        except Exception:
+            pass
+
+
 NO_COMPRESS_EXTS = {".jpg", ".jpeg"}
 
 
@@ -1447,6 +1764,8 @@ class App(tk.Tk):
                    command=self._start_resume).pack(pady=6)
         ttk.Button(frame, text="Am I Good To Delete? / Validate cloud", width=30,
                    command=self._open_deletion_check).pack(pady=6)
+        ttk.Button(frame, text="Download from cloud", width=30,
+                   command=self._open_download).pack(pady=6)
         ttk.Button(frame, text="Advanced options...", width=30,
                    command=self._open_advanced).pack(pady=6)
         ttk.Button(frame, text="Exit", width=30, command=self.destroy).pack(pady=6)
@@ -1457,10 +1776,28 @@ class App(tk.Tk):
     def _open_deletion_check(self):
         DeletionCheckDialog(self)
 
+    def _open_download(self):
+        DownloadDialog(self, on_start=self._start_download)
+
+    def _start_download(self, manifests: list[dict], destination: Path):
+        self._mode = "download"
+        self._build_progress()
+        session = DownloadSession(
+            manifests=manifests,
+            destination=destination,
+            advanced=dict(self.advanced),
+            log_cb=self._log,
+            progress_cb=self._progress,
+            done_cb=self._done,
+        )
+        self.session = session
+        session.start()
+
     def _start_new_wizard(self):
         NewUploadWizard(self, on_ready=self._start_session)
 
     def _start_session(self, manifests: list[tuple[dict, Path]]):
+        self._mode = "upload"
         self._build_progress()
         session = UploadSession(
             manifests=manifests,
@@ -1541,7 +1878,8 @@ class App(tk.Tk):
             self.failed_var.set(f"Failed: {failed}")
             self.speed_var.set(f"Speed: {_fmt_rate(stats['speed_bps'])}")
             self.eta_var.set(f"ETA: {_fmt_eta(stats['eta_seconds'])}")
-            self.bytes_var.set(f"Uploaded: {_fmt_bytes(stats['bytes_uploaded'])}")
+            verb = "Downloaded" if getattr(self, "_mode", "upload") == "download" else "Uploaded"
+            self.bytes_var.set(f"{verb}: {_fmt_bytes(stats['bytes_uploaded'])}")
             if stats["current"]:
                 self.current_item.set(stats["current"])
         self.after(0, apply)
@@ -2464,6 +2802,245 @@ class ResumeDialog(tk.Toplevel):
             return
         self.destroy()
         self.on_pick(m, path)
+
+
+# --- download dialog ---------------------------------------------------------
+
+
+class DownloadDialog(tk.Toplevel):
+    """Discover what's available in the cloud for a valid feeder, show
+    per-(kind, date) completeness, let the pilot pick dates and a
+    destination, then hand the loaded manifests to the App to run a
+    DownloadSession. Only valid feeders and only date-shaped subfolders
+    are considered -- unrelated cruft in /lidardata/xcel/2026/ is
+    ignored."""
+
+    COLUMNS = ("kind", "date", "verified", "total", "status")
+
+    def __init__(self, parent: App, on_start):
+        super().__init__(parent)
+        self.title("Download from cloud")
+        self.geometry("980x680")
+        self.on_start = on_start
+        self.parent_app = parent
+
+        self.transient(parent)
+        self.lift()
+        self.attributes("-topmost", True)
+        self.after(300, lambda: self.attributes("-topmost", False))
+        self.focus_force()
+        self.grab_set()
+
+        self.client_var = tk.StringVar(value=VALID_CLIENTS[0])
+        self.program_var = tk.StringVar(value=VALID_PROGRAMS[0])
+        self.feeder_var = tk.StringVar()
+        self.dest_var = tk.StringVar()
+
+        # date -> {"kind","date","total","verified","status","manifest"}
+        self._rows: list[dict] = []
+
+        pad = {"padx": 8, "pady": 4}
+        row = 0
+        ttk.Label(self, text="Client").grid(row=row, column=0, sticky="w", **pad)
+        ttk.Combobox(self, values=VALID_CLIENTS, textvariable=self.client_var,
+                     state="readonly").grid(row=row, column=1, sticky="ew", **pad)
+        row += 1
+        ttk.Label(self, text="Program").grid(row=row, column=0, sticky="w", **pad)
+        ttk.Combobox(self, values=VALID_PROGRAMS, textvariable=self.program_var,
+                     state="readonly").grid(row=row, column=1, sticky="ew", **pad)
+        row += 1
+        ttk.Label(self, text="Feeder").grid(row=row, column=0, sticky="w", **pad)
+        # Downloads are restricted to known feeders -- readonly Combobox so a
+        # typo can't produce a fake path (and we know VALID_FEEDERS lists the
+        # only paths worth reconstructing under /lidardata/xcel/2026/).
+        AutocompleteCombobox(self, VALID_FEEDERS, textvariable=self.feeder_var,
+                             state="normal", uppercase=True
+                             ).grid(row=row, column=1, sticky="ew", **pad)
+        ttk.Button(self, text="Load dates", command=self._load).grid(
+            row=row, column=2, **pad)
+        row += 1
+
+        warn = tk.Message(
+            self,
+            text=(
+                "WARNING: 'Verified / Total' comes from the cloud manifest for "
+                "each date. If a pilot has NOT yet started their upload for a "
+                "date, their items are absent from the manifest -- a fully green "
+                "row does NOT guarantee that ALL data for that day has been "
+                "uploaded. When multiple pilots split a day, coordinate with "
+                "them before treating a green row as final."
+            ),
+            width=940, foreground="#8a4b00",
+        )
+        warn.grid(row=row, column=0, columnspan=3, sticky="ew", padx=8, pady=(4, 6))
+        row += 1
+
+        # Legend
+        legend = ttk.Frame(self, padding=(8, 0))
+        legend.grid(row=row, column=0, columnspan=3, sticky="w")
+        for text, color in [("Complete", "#c9f2c9"), ("In progress", "#fff2c9"),
+                            ("Empty / unreadable", "#f2c9c9")]:
+            lab = tk.Label(legend, text=f"  {text}  ", background=color,
+                            relief="solid", borderwidth=1)
+            lab.pack(side="left", padx=4)
+        row += 1
+
+        tree_frame = ttk.Frame(self)
+        tree_frame.grid(row=row, column=0, columnspan=3, sticky="nsew",
+                        padx=8, pady=6)
+        self.tree = ttk.Treeview(tree_frame, columns=self.COLUMNS,
+                                 show="headings", selectmode="extended",
+                                 height=14)
+        widths = (100, 120, 90, 90, 180)
+        for col, w in zip(self.COLUMNS, widths):
+            self.tree.heading(col, text=col.title())
+            self.tree.column(col, width=w, anchor="w")
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical",
+                            command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        self.tree.tag_configure("complete", background="#c9f2c9")
+        self.tree.tag_configure("partial", background="#fff2c9")
+        self.tree.tag_configure("empty", background="#f2c9c9")
+        self.rowconfigure(row, weight=1)
+        self.columnconfigure(1, weight=1)
+        row += 1
+
+        dest = ttk.Frame(self, padding=(8, 4))
+        dest.grid(row=row, column=0, columnspan=3, sticky="ew")
+        ttk.Label(dest, text="Destination folder").pack(side="left")
+        ttk.Entry(dest, textvariable=self.dest_var, width=60).pack(
+            side="left", padx=6, fill="x", expand=True)
+        ttk.Button(dest, text="Browse", command=self._pick_dest).pack(side="left")
+        row += 1
+
+        btns = ttk.Frame(self, padding=(8, 4))
+        btns.grid(row=row, column=0, columnspan=3, sticky="ew")
+        ttk.Button(btns, text="Download selected",
+                   command=self._download).pack(side="left")
+        ttk.Button(btns, text="Cancel", command=self.destroy).pack(side="right")
+
+        self.status_var = tk.StringVar(value="")
+        ttk.Label(self, textvariable=self.status_var).grid(
+            row=row + 1, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 6))
+
+    def _pick_dest(self):
+        d = filedialog.askdirectory(title="Select destination folder")
+        if d:
+            self.dest_var.set(d)
+
+    def _load(self):
+        feeder = self.feeder_var.get().strip().upper()
+        if feeder not in VALID_FEEDERS:
+            if not messagebox.askyesno(
+                "Unknown feeder",
+                f"'{feeder}' is not in the known feeder list. Load anyway?",
+            ):
+                return
+        for iid in self.tree.get_children():
+            self.tree.delete(iid)
+        self._rows.clear()
+        self.status_var.set("Scanning cloud for dates...")
+        client = self.client_var.get()
+        program = self.program_var.get()
+        threading.Thread(target=self._load_worker,
+                          args=(client, program, feeder), daemon=True).start()
+
+    def _load_worker(self, client: str, program: str, feeder: str):
+        try:
+            dates_by_kind = discover_dates_for_feeder(client, program, feeder)
+        except Exception as e:
+            self.after(0, lambda: self.status_var.set(f"Discovery failed: {e}"))
+            return
+        rows: list[dict] = []
+        for kind, dates in dates_by_kind.items():
+            for date in dates:
+                path = manifest_blob_path_for(kind, client, program, feeder, date)
+                try:
+                    m = load_cloud_manifest_at(path)
+                except Exception as e:
+                    m = None
+                    self.after(0, lambda e=e, k=kind, d=date:
+                               self._log_status(f"warn: manifest read failed for {k}/{d}: {e}"))
+                if m is None:
+                    rows.append({
+                        "kind": kind, "date": date, "verified": 0,
+                        "total": 0, "status": "no manifest",
+                        "tag": "empty", "manifest": None,
+                    })
+                    continue
+                items = m.get("items", {}) or {}
+                verified = sum(1 for it in items.values() if it.get("status") == STATUS_VERIFIED)
+                total = len(items)
+                if total == 0:
+                    tag = "empty"
+                    status = "empty"
+                elif verified == total:
+                    tag = "complete"
+                    status = "complete"
+                else:
+                    tag = "partial"
+                    status = f"in progress ({verified}/{total} verified)"
+                rows.append({
+                    "kind": kind, "date": date, "verified": verified,
+                    "total": total, "status": status, "tag": tag,
+                    "manifest": m,
+                })
+
+        def apply():
+            self._rows = rows
+            for i, r in enumerate(rows):
+                iid = f"{r['kind']}::{r['date']}"
+                self.tree.insert("", "end", iid=iid, tags=(r["tag"],),
+                                 values=(r["kind"], r["date"],
+                                         r["verified"], r["total"], r["status"]))
+            self.status_var.set(f"Found {len(rows)} date(s) across SENSOR_DATA + BASE_STATION.")
+        self.after(0, apply)
+
+    def _log_status(self, msg: str):
+        self.status_var.set(msg)
+
+    def _download(self):
+        dest = self.dest_var.get().strip()
+        if not dest:
+            messagebox.showerror("No destination", "Pick a destination folder first.")
+            return
+        dest_path = Path(dest)
+        if not dest_path.exists():
+            try:
+                dest_path.mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                messagebox.showerror("Bad destination", f"Cannot create: {e}")
+                return
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showerror("Pick rows", "Select one or more dates to download.")
+            return
+        chosen: list[dict] = []
+        for iid in sel:
+            row = next((r for r in self._rows
+                        if f"{r['kind']}::{r['date']}" == iid), None)
+            if row and row.get("manifest") and row["total"] > 0:
+                chosen.append(row["manifest"])
+        if not chosen:
+            messagebox.showerror("Nothing usable",
+                                 "Selected rows have no manifest / no items to download.")
+            return
+        verified_total = sum(
+            sum(1 for it in m.get("items", {}).values() if it.get("status") == STATUS_VERIFIED)
+            for m in chosen
+        )
+        if not messagebox.askyesno(
+            "Confirm download",
+            f"Download {verified_total} verified item(s) across {len(chosen)} date(s) "
+            f"into:\n{dest_path}\n\nOnly items marked verified in the manifest are "
+            f"downloaded. Zips are md5-verified and then extracted so the mission "
+            f"folders appear exactly as they were uploaded.",
+        ):
+            return
+        self.destroy()
+        self.on_start(chosen, dest_path)
 
 
 # --- drive remap dialog ------------------------------------------------------
