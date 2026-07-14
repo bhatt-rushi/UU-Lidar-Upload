@@ -85,6 +85,15 @@ BLOB_URL_BASE = f"https://{STORAGE_ACCOUNT}.blob.core.windows.net/{CONTAINER}"
 
 VALID_CLIENTS = ["xcel"]
 VALID_PROGRAMS = ["2026"]
+# Suggested pilot names. Pilots can also type in a custom name if they don't
+# find themselves here -- edit this list to keep it current.
+VALID_PILOTS = [
+    "Zachariah Ellefson",
+    "Anthony Pazzulla",
+    "Timothy Powell",
+    "Nathaniel Bailey",
+    "Nick Mims",
+]
 SENSOR_CHOICES = [("L3", True), ("TV540", False), ("TVGO", False)]
 
 DATA_TYPE_RAW = "RAW_SENSOR"
@@ -1579,7 +1588,10 @@ class NewUploadWizard(tk.Toplevel):
                      state="readonly").grid(row=row, column=1, sticky="ew", **pad)
         row += 1
         ttk.Label(self, text="Pilot name").grid(row=row, column=0, sticky="w", **pad)
-        ttk.Entry(self, textvariable=self.pilot_var).grid(row=row, column=1, sticky="ew", **pad)
+        # state="normal" (not "readonly") so pilots can type a custom name if
+        # they aren't in VALID_PILOTS.
+        ttk.Combobox(self, values=VALID_PILOTS, textvariable=self.pilot_var,
+                     state="normal").grid(row=row, column=1, sticky="ew", **pad)
         row += 1
         ttk.Label(self, text="Feeder (e.g. LAW322)").grid(row=row, column=0, sticky="w", **pad)
         e = ttk.Entry(self, textvariable=self.feeder_var)
