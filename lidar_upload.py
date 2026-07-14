@@ -143,6 +143,11 @@ DEFAULT_ADVANCED = {
                                   # retry_failed_interval_seconds between
                                   # passes
     "retry_failed_interval_seconds": 300,
+    "zip_queue_depth": 5,         # max number of pre-zipped missions that
+                                  # can sit in the queue waiting for the
+                                  # uploader; higher = uploader never
+                                  # starves on a fast link, but each ready
+                                  # zip takes disk space in the scratch dir
 }
 
 STATUS_PENDING = "pending"
@@ -702,7 +707,8 @@ class UploadSession:
         self.progress_cb = progress_cb
         self.done_cb = done_cb
         self._stop = threading.Event()
-        self._zip_queue: queue.Queue = queue.Queue(maxsize=1)
+        self._zip_queue: queue.Queue = queue.Queue(
+            maxsize=int(advanced.get("zip_queue_depth", 5) or 5))
         self._thread: threading.Thread | None = None
         # rolling upload stats: list of (bytes, duration_seconds) for successful
         # verified uploads. Speed is measured only on actual azcopy upload time
@@ -913,7 +919,8 @@ class UploadSession:
         base_manifests = [(m, p) for m, p in self.manifests if m["kind"] == KIND_BASE]
 
         if sensor_manifests and not self._stop.is_set():
-            self._zip_queue = queue.Queue(maxsize=1)  # fresh queue each pass
+            depth = int(self.advanced.get("zip_queue_depth", 5) or 5)
+            self._zip_queue = queue.Queue(maxsize=depth)  # fresh queue each pass
             zipper = threading.Thread(target=self._zip_loop,
                                       args=(sensor_manifests,), daemon=True)
             zipper.start()
@@ -1929,6 +1936,7 @@ class AdvancedDialog(tk.Toplevel):
             ("Local retries per item (X)", "local_retries", int),
             ("azcopy per-call timeout seconds (T)", "timeout_seconds", int),
             ("Retry-failed interval seconds (between passes)", "retry_failed_interval_seconds", int),
+            ("Zip queue depth (missions pre-zipped ahead of upload)", "zip_queue_depth", int),
             ("Zip scratch dir (blank = temp)", "zip_scratch_dir", str),
         ]
         for i, (label, key, _t) in enumerate(rows):
