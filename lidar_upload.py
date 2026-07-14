@@ -94,6 +94,20 @@ VALID_PILOTS = [
     "Nathaniel Bailey",
     "Nick Mims",
 ]
+# Known feeder names. The wizard autocompletes against this list, but a pilot
+# can type a custom feeder for troubleshooting / one-offs (warning is emitted
+# if it doesn't match the LLLDDD pattern). Edit this list to keep it current.
+VALID_FEEDERS = [
+    "BRT060", "CNT061", "CNT071", "CUM081", "CUM082", "FLS062", "FLS074",
+    "GRT311", "LAW312", "LAW321", "LAW322", "LCO061", "LCO062", "LCO063",
+    "LCO071", "LCO072", "LCO073", "LOU061", "LOU062", "LOU071", "LOU072",
+    "LUK021", "MHA061", "MHA062", "MHA063", "MHA072", "MHA073", "MRC021",
+    "MRC022", "PSI020", "RCL031", "RTL021", "RTL022", "SAL310", "SCF031",
+    "SCF032", "SCF033", "SOR060", "SOR061", "SOR062", "SOR063", "SOR070",
+    "SOR071", "SOR072", "SOR073", "SOR080", "SOR081", "SOR082", "SOS070",
+    "SOS071", "SOS072", "TAD081", "WSF062", "WSF065", "WSF073", "WSF074",
+    "YLR081", "YLR082",
+]
 SENSOR_CHOICES = [("L3", True), ("TV540", False), ("TVGO", False)]
 
 DATA_TYPE_RAW = "RAW_SENSOR"
@@ -1334,6 +1348,58 @@ def create_feeder_readmes(client: str, program: str, feeder: str):
 # =============================================================================
 
 
+class AutocompleteCombobox(ttk.Combobox):
+    """Combobox with inline prefix autocomplete.
+
+    As the user types, the widget (a) filters its dropdown values to prefix
+    matches and (b) inline-completes the field to the first match with the
+    auto-inserted tail highlighted, so the next keystroke replaces it and
+    pressing Right / End accepts. Set ``uppercase=True`` to force-uppercase
+    typing (used for feeder names). Pilots can still type a custom value
+    that doesn't appear in the list -- the completion is a hint, not a
+    constraint.
+    """
+
+    _NAV_KEYS = {"BackSpace", "Delete", "Left", "Right", "Up", "Down",
+                 "Home", "End", "Escape", "Return", "Tab",
+                 "Shift_L", "Shift_R", "Control_L", "Control_R",
+                 "Alt_L", "Alt_R"}
+
+    def __init__(self, master, completion_values, textvariable=None,
+                 uppercase: bool = False, **kw):
+        super().__init__(master, values=completion_values,
+                         textvariable=textvariable, **kw)
+        self._all_values = sorted(set(completion_values), key=str.casefold)
+        self._uppercase = uppercase
+        self.bind("<KeyRelease>", self._on_keyrelease)
+
+    def _on_keyrelease(self, event):
+        if event.keysym in self._NAV_KEYS:
+            return
+        typed = self.get()
+        if self._uppercase and typed != typed.upper():
+            cursor = self.index("insert")
+            self.delete(0, "end")
+            self.insert(0, typed.upper())
+            self.icursor(cursor)
+            typed = typed.upper()
+        if not typed:
+            self.configure(values=self._all_values)
+            return
+        low = typed.lower()
+        matches = [v for v in self._all_values if v.lower().startswith(low)]
+        self.configure(values=matches or self._all_values)
+        if matches:
+            first = matches[0]
+            if len(first) > len(typed):
+                # Inline-complete: fill the tail and select it so the next
+                # keystroke replaces the auto-inserted portion.
+                self.delete(0, "end")
+                self.insert(0, first)
+                self.select_range(len(typed), "end")
+                self.icursor(len(typed))
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -1588,20 +1654,18 @@ class NewUploadWizard(tk.Toplevel):
                      state="readonly").grid(row=row, column=1, sticky="ew", **pad)
         row += 1
         ttk.Label(self, text="Pilot name").grid(row=row, column=0, sticky="w", **pad)
-        # state="normal" (not "readonly") so pilots can type a custom name if
-        # they aren't in VALID_PILOTS.
-        ttk.Combobox(self, values=VALID_PILOTS, textvariable=self.pilot_var,
-                     state="normal").grid(row=row, column=1, sticky="ew", **pad)
+        # state="normal" (not "readonly") + AutocompleteCombobox so pilots
+        # see suggestions as they type but can still enter a custom name.
+        AutocompleteCombobox(self, VALID_PILOTS, textvariable=self.pilot_var,
+                             state="normal").grid(row=row, column=1, sticky="ew", **pad)
         row += 1
         ttk.Label(self, text="Feeder (e.g. LAW322)").grid(row=row, column=0, sticky="w", **pad)
-        e = ttk.Entry(self, textvariable=self.feeder_var)
-        e.grid(row=row, column=1, sticky="ew", **pad)
-        e.bind("<KeyRelease>", lambda _e: self.feeder_var.set(self.feeder_var.get().upper()))
+        AutocompleteCombobox(self, VALID_FEEDERS, textvariable=self.feeder_var,
+                             state="normal", uppercase=True).grid(row=row, column=1, sticky="ew", **pad)
         row += 1
         ttk.Label(self, text="Re-type feeder to confirm").grid(row=row, column=0, sticky="w", **pad)
-        e2 = ttk.Entry(self, textvariable=self.feeder_confirm_var)
-        e2.grid(row=row, column=1, sticky="ew", **pad)
-        e2.bind("<KeyRelease>", lambda _e: self.feeder_confirm_var.set(self.feeder_confirm_var.get().upper()))
+        AutocompleteCombobox(self, VALID_FEEDERS, textvariable=self.feeder_confirm_var,
+                             state="normal", uppercase=True).grid(row=row, column=1, sticky="ew", **pad)
         row += 1
         ttk.Label(self, text="Sensor").grid(row=row, column=0, sticky="w", **pad)
         sensor_frame = ttk.Frame(self)
