@@ -512,12 +512,8 @@ def scan_base_station(folder: Path) -> tuple[list[Path], str | None, list[str]]:
             continue
         low = entry.name.lower()
         if low in BASE_STATION_INDEX_NAMES:
-            # latest_index is a control file that's not needed after the fact
-            # and, because its name is identical across every collection date,
-            # it collides with itself in per-item tracking (e.g. the download
-            # session's dedup set). Skip it silently -- the pilot doesn't need
-            # to remove it from the folder.
-            warnings.append(f"ignoring {entry.name} (not uploaded by design)")
+            # latest_index is a control file that isn't needed after the
+            # fact. Silently drop it; only the .dat files matter.
             continue
         m = BASE_STATION_DAT_REGEX.match(entry.name)
         if m:
