@@ -512,7 +512,12 @@ def scan_base_station(folder: Path) -> tuple[list[Path], str | None, list[str]]:
             continue
         low = entry.name.lower()
         if low in BASE_STATION_INDEX_NAMES:
-            dats.append(entry)
+            # latest_index is a control file that's not needed after the fact
+            # and, because its name is identical across every collection date,
+            # it collides with itself in per-item tracking (e.g. the download
+            # session's dedup set). Skip it silently -- the pilot doesn't need
+            # to remove it from the folder.
+            warnings.append(f"ignoring {entry.name} (not uploaded by design)")
             continue
         m = BASE_STATION_DAT_REGEX.match(entry.name)
         if m:
@@ -522,7 +527,7 @@ def scan_base_station(folder: Path) -> tuple[list[Path], str | None, list[str]]:
             except ValueError:
                 pass
             continue
-        warnings.append(f"rejected (only .dat + latest_index allowed): {entry.name}")
+        warnings.append(f"rejected (only .dat allowed): {entry.name}")
     if len(dates) > 1:
         warnings.append(f"multiple collection dates in .dat filenames: {sorted(dates)}")
     date = sorted(dates)[0] if dates else None
@@ -903,7 +908,31 @@ class UploadSession:
                     self._log(f"[retry] reset {n_reset} item(s) to pending; starting next pass")
                     self._run_one_pass()
 
-            self.done_cb(True, "All uploads finished.")
+            total = sum(len(m["items"]) for m, _ in self.manifests)
+            verified = sum(
+                1 for m, _ in self.manifests
+                for it in m["items"].values()
+                if it.get("status") == STATUS_VERIFIED
+            )
+            failed = sum(
+                1 for m, _ in self.manifests
+                for it in m["items"].values()
+                if it.get("status") == STATUS_FAILED
+            )
+            other = total - verified - failed
+            if self._stop.is_set():
+                self.done_cb(False,
+                             f"Upload stopped early. {verified} verified, "
+                             f"{failed} failed, {other} not attempted "
+                             f"(of {total}).")
+            elif failed or other:
+                self.done_cb(False,
+                             f"Upload finished with {failed} failed and "
+                             f"{other} unfinished item(s) (of {total}). "
+                             f"See the log.")
+            else:
+                self.done_cb(True,
+                             f"All uploads finished. {verified} item(s) verified.")
         except Exception as e:
             self._log(f"FATAL: {e}\n{traceback.format_exc()}")
             self.done_cb(False, str(e))
@@ -1415,8 +1444,13 @@ class DownloadSession:
             "name": None, "size_bytes": 0,
             "bytes_over_wire": 0, "start_monotonic": None,
         }
-        self._verified: set[str] = set()
-        self._failed: set[str] = set()
+        # Keyed by (manifest_blob_path, item_name) rather than just name so
+        # that duplicated filenames across dates (e.g. an identical
+        # base-station control file appearing in every day's folder) don't
+        # collapse to a single entry -- which would make the total count
+        # look permanently short.
+        self._verified: set[tuple[str, str]] = set()
+        self._failed: set[tuple[str, str]] = set()
         self._recent: list[tuple[int, float]] = []
         self._recent_window = 8
 
@@ -1487,7 +1521,28 @@ class DownloadSession:
                 if self._stop.is_set():
                     break
                 self._download_manifest(m)
-            self.done_cb(True, "Download complete.")
+            total = 0
+            for m in self.manifests:
+                for it in m["items"].values():
+                    if it.get("status") == STATUS_VERIFIED:
+                        total += 1
+            done = len(self._verified)
+            failed = len(self._failed)
+            interrupted = total - done - failed
+            if self._stop.is_set():
+                self.done_cb(False,
+                             f"Download stopped early. {done} verified, "
+                             f"{failed} failed, {interrupted} not attempted "
+                             f"(of {total}).")
+            elif failed or interrupted:
+                self.done_cb(False,
+                             f"Download finished with problems. "
+                             f"{done} verified, {failed} failed, "
+                             f"{interrupted} unaccounted for (of {total}). "
+                             f"See the log.")
+            else:
+                self.done_cb(True,
+                             f"Download complete. All {done} item(s) verified.")
         except Exception as e:
             self._log(f"FATAL: {e}\n{traceback.format_exc()}")
             self.done_cb(False, str(e))
@@ -1504,6 +1559,7 @@ class DownloadSession:
             self._download_one(m, name, item)
 
     def _download_one(self, m: dict, name: str, item: dict):
+        key = (m.get("manifest_blob_path", ""), name)
         feeder_dir = (self.destination / m["client"] / m["program"] /
                       m["feeder"])
         subdir = DIR_SENSOR_DATA if m["kind"] == KIND_SENSOR else DIR_BASE_STATION
@@ -1555,7 +1611,7 @@ class DownloadSession:
                     except Exception:
                         pass
                 self._record(size, time.monotonic() - t0)
-                self._verified.add(name)
+                self._verified.add(key)
                 self._end_transfer()
                 self._log(f"[dl] {name}: OK")
                 self._progress(name)
@@ -1564,7 +1620,7 @@ class DownloadSession:
                 self._log(f"[dl] {name}: attempt {attempt} failed: {e}")
                 self._end_transfer()
                 self._sleep_backoff(attempt)
-        self._failed.add(name)
+        self._failed.add(key)
         self._log(f"[dl] {name}: exhausted retries")
         self._progress(name)
 
@@ -1576,14 +1632,16 @@ class DownloadSession:
             bytes_done = 0
             remaining_bytes = 0
             for m in self.manifests:
+                mpath = m.get("manifest_blob_path", "")
                 for name, item in m["items"].items():
                     if item.get("status") != STATUS_VERIFIED:
                         continue
                     total += 1
                     size = item.get("zip_size_bytes") or item.get("size_bytes") or 0
-                    if name in self._verified:
+                    key = (mpath, name)
+                    if key in self._verified:
                         bytes_done += size
-                    elif name not in self._failed and size:
+                    elif key not in self._failed and size:
                         remaining_bytes += size
 
             with self._current_lock:
