@@ -136,6 +136,14 @@ BASE_STATION_DAT_REGEX = re.compile(
     r"^DRTK\d+_\d+_(?P<Y>\d{4})(?P<M>\d{2})(?P<D>\d{2})\d{6}_.+\.dat$",
     re.IGNORECASE,
 )
+# RINEX 2 observation-file extension: two digits (the year) followed by 'o'.
+# e.g. .26o, .25o. Case-insensitive per RINEX convention.
+RINEX_OBS_EXT_REGEX = re.compile(r"\.\d{2}[oO]$")
+# In a RINEX 2 header the "PGM / RUN BY / DATE" line carries the run date in
+# DD-MM-YY form (CHC Navigation format). We grep for the first DD-MM-YY on
+# that line rather than relying on fixed columns since receivers pad
+# differently.
+RINEX_HEADER_DATE_REGEX = re.compile(r"(\d{2})-(\d{2})-(\d{2})")
 BASE_STATION_INDEX_NAMES = {"latest_index", "latest_index.txt"}
 
 PROCESSED_EXTS = {".las", ".laz"}
@@ -540,8 +548,40 @@ def detect_data_type(source_root: Path, sensor: str) -> str | None:
     return None
 
 
+def parse_rinex_obs_date(path: Path) -> str | None:
+    """Read a RINEX 2 observation file's header and pull the run date off
+    the "PGM / RUN BY / DATE" line, which carries DD-MM-YY in the CHC
+    Navigation format. Returns 'YYYY-MM-DD' or None if we can't find it.
+    Reads only the header (up to 60 lines or 'END OF HEADER')."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for _ in range(60):
+                line = f.readline()
+                if not line:
+                    break
+                if "PGM / RUN BY / DATE" in line:
+                    m = RINEX_HEADER_DATE_REGEX.search(line)
+                    if not m:
+                        return None
+                    dd, mm, yy = m.groups()
+                    try:
+                        # 2-digit year -> assume 20YY (safe for this decade
+                        # and matches how the base stations are configured).
+                        return dt.date(2000 + int(yy), int(mm), int(dd)).isoformat()
+                    except ValueError:
+                        return None
+                if "END OF HEADER" in line:
+                    return None
+    except Exception:
+        return None
+    return None
+
+
 def scan_base_station(folder: Path) -> tuple[list[Path], str | None, list[str]]:
-    dats: list[Path] = []
+    """Accept .dat (CHC RTK) and RINEX-2 observation files (.YYo). Both
+    require the pilot to trust the typed feeder since neither format
+    encodes it. Returns (files, single-collection-date, warnings)."""
+    files: list[Path] = []
     warnings: list[str] = []
     dates: set[str] = set()
     for entry in folder.iterdir():
@@ -551,21 +591,33 @@ def scan_base_station(folder: Path) -> tuple[list[Path], str | None, list[str]]:
         low = entry.name.lower()
         if low in BASE_STATION_INDEX_NAMES:
             # latest_index is a control file that isn't needed after the
-            # fact. Silently drop it; only the .dat files matter.
+            # fact. Silently drop it; only the .dat / RINEX files matter.
             continue
         m = BASE_STATION_DAT_REGEX.match(entry.name)
         if m:
-            dats.append(entry)
+            files.append(entry)
             try:
                 dates.add(dt.date(int(m["Y"]), int(m["M"]), int(m["D"])).isoformat())
             except ValueError:
                 pass
             continue
-        warnings.append(f"rejected (only .dat allowed): {entry.name}")
+        if RINEX_OBS_EXT_REGEX.search(entry.name):
+            date = parse_rinex_obs_date(entry)
+            if date:
+                files.append(entry)
+                dates.add(date)
+            else:
+                warnings.append(
+                    f"rejected (RINEX header date not readable): {entry.name}"
+                )
+            continue
+        warnings.append(
+            f"rejected (only .dat or RINEX .YYo files allowed): {entry.name}"
+        )
     if len(dates) > 1:
-        warnings.append(f"multiple collection dates in .dat filenames: {sorted(dates)}")
+        warnings.append(f"multiple collection dates seen: {sorted(dates)}")
     date = sorted(dates)[0] if dates else None
-    return dats, date, warnings
+    return files, date, warnings
 
 
 # --- manifest ----------------------------------------------------------------
@@ -2498,6 +2550,21 @@ class NewUploadWizard(tk.Toplevel):
             f"Is that correct? All data will be filed under this feeder."
         ):
             return
+        # Extra confirmation for base station: neither .dat filenames nor
+        # RINEX headers encode the feeder, so we can only cross-check by
+        # asking the pilot to confirm their records.
+        bi = self.scanned.get("base_info")
+        if bi:
+            n = len(bi["files"])
+            if not messagebox.askyesno(
+                "Confirm base station",
+                f"{n} base station file(s) (.dat / RINEX .YYo) will be filed "
+                f"under feeder '{feeder}' at collection date {bi['date']}.\n\n"
+                f"Neither format embeds the feeder in its filename, so this "
+                f"can't be validated by the tool -- confirm the pilot's "
+                f"records say these files belong to this feeder. Continue?"
+            ):
+                return
         self._start()
 
     def _start(self):
