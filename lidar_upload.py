@@ -619,11 +619,159 @@ def save_cloud_manifest(m: dict) -> None:
     _finalize_summary(m)
     data = json.dumps(m, indent=2, sort_keys=True).encode("utf-8")
     blob_put_bytes(blob_url_for_path(m["manifest_blob_path"]), data, content_type="application/json")
+    # Fire-and-forget master-index update so the Upload Tracker page has a
+    # single-blob view of every session. Failure here is non-fatal; the
+    # tracker's Refresh button rebuilds by re-enumerating.
+    def _bg_index():
+        try:
+            upsert_master_index_entry(m)
+        except Exception:
+            pass
+    threading.Thread(target=_bg_index, daemon=True).start()
 
 
 def load_cloud_manifest_at(blob_path: str) -> dict | None:
     data = blob_get_bytes(blob_url_for_path(blob_path))
     return json.loads(data.decode("utf-8")) if data else None
+
+
+# --- master upload index -----------------------------------------------------
+#
+# A single blob at {client}/{program}/_uploads_index.json enumerates every
+# per-date manifest that has been written under that program, with pilot /
+# system / progress / timing metadata pulled from the manifest. Session
+# writes upsert an entry on every save; the tracker dialog can also fully
+# rebuild by re-enumerating every VALID_FEEDERS. Concurrent writes are
+# handled with an If-Match / ETag retry loop.
+
+
+MASTER_INDEX_VERSION = 1
+
+
+def master_index_blob_path(client: str, program: str) -> str:
+    return f"{client}/{program}/_uploads_index.json"
+
+
+def build_index_entry(m: dict) -> dict:
+    items = m.get("items", {}) or {}
+    pilots = sorted({it.get("pilot_name") for it in items.values()
+                     if it.get("pilot_name")})
+    systems = sorted({it.get("system_name") for it in items.values()
+                      if it.get("system_name")})
+    return {
+        "feeder": m["feeder"],
+        "kind": m["kind"],
+        "collection_date": m["collection_date"],
+        "manifest_blob_path": m["manifest_blob_path"],
+        "pilot_name": m.get("pilot_name"),      # top-level = last writer
+        "system_name": m.get("system_name"),
+        "session_id": m.get("session_id"),
+        "created_utc": m.get("created_utc"),
+        "updated_utc": m.get("updated_utc"),
+        "total": len(items),
+        "verified": sum(1 for it in items.values() if it.get("status") == STATUS_VERIFIED),
+        "pilots": pilots,
+        "systems": systems,
+    }
+
+
+def _fetch_index_with_etag(client: str, program: str) -> tuple[dict, str]:
+    url = blob_url_for_path(master_index_blob_path(client, program))
+    try:
+        with urllib.request.urlopen(url, timeout=60) as r:
+            data = r.read()
+            etag = r.headers.get("ETag", "")
+            return json.loads(data.decode("utf-8")), etag
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return {"version": MASTER_INDEX_VERSION, "entries": []}, ""
+        raise
+
+
+def _put_index(client: str, program: str, idx: dict, etag: str) -> bool:
+    """Return True on success, False on ETag conflict (caller should retry)."""
+    idx["version"] = MASTER_INDEX_VERSION
+    idx["updated_utc"] = utcnow()
+    body = json.dumps(idx, indent=2, sort_keys=True).encode("utf-8")
+    url = blob_url_for_path(master_index_blob_path(client, program))
+    req = urllib.request.Request(url, data=body, method="PUT")
+    req.add_header("x-ms-blob-type", "BlockBlob")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Content-Length", str(len(body)))
+    if etag:
+        req.add_header("If-Match", etag)
+    else:
+        # First writer for this index: don't clobber if someone else beat us.
+        req.add_header("If-None-Match", "*")
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return r.status in (200, 201)
+    except urllib.error.HTTPError as e:
+        if e.code in (409, 412):
+            return False
+        raise
+
+
+def upsert_master_index_entry(m: dict) -> None:
+    entry = build_index_entry(m)
+    for _attempt in range(6):
+        idx, etag = _fetch_index_with_etag(m["client"], m["program"])
+        entries = idx.get("entries") or []
+        prior = next((e for e in entries
+                      if e.get("manifest_blob_path") == entry["manifest_blob_path"]),
+                     None)
+        if prior and prior.get("created_utc"):
+            entry["created_utc"] = prior["created_utc"]
+        entries = [e for e in entries
+                   if e.get("manifest_blob_path") != entry["manifest_blob_path"]]
+        entries.append(entry)
+        idx["entries"] = entries
+        if _put_index(m["client"], m["program"], idx, etag):
+            return
+    raise RuntimeError("upsert_master_index_entry: retries exhausted")
+
+
+def load_master_index(client: str, program: str) -> dict:
+    idx, _etag = _fetch_index_with_etag(client, program)
+    return idx
+
+
+def rebuild_master_index(client: str, program: str,
+                         progress_cb=None) -> dict:
+    """Re-enumerate every valid feeder and rewrite the index from scratch."""
+    entries = []
+    total = len(VALID_FEEDERS)
+    for i, feeder in enumerate(VALID_FEEDERS):
+        if progress_cb:
+            try:
+                progress_cb(i, total, feeder)
+            except Exception:
+                pass
+        try:
+            dates = discover_dates_for_feeder(client, program, feeder)
+        except Exception:
+            continue
+        for kind, date_list in dates.items():
+            for date in date_list:
+                path = manifest_blob_path_for(kind, client, program, feeder, date)
+                try:
+                    m = load_cloud_manifest_at(path)
+                except Exception:
+                    m = None
+                if not m:
+                    continue
+                entries.append(build_index_entry(m))
+    if progress_cb:
+        try:
+            progress_cb(total, total, "")
+        except Exception:
+            pass
+    idx = {"version": MASTER_INDEX_VERSION,
+           "updated_utc": utcnow(), "entries": entries}
+    body = json.dumps(idx, indent=2, sort_keys=True).encode("utf-8")
+    blob_put_bytes(blob_url_for_path(master_index_blob_path(client, program)),
+                   body, content_type="application/json")
+    return idx
 
 
 def save_local_manifest(m: dict, path: Path) -> None:
@@ -1823,6 +1971,8 @@ class App(tk.Tk):
                    command=self._start_new_wizard).pack(pady=6)
         ttk.Button(frame, text="Resume from manifest...", width=30,
                    command=self._start_resume).pack(pady=6)
+        ttk.Button(frame, text="Upload tracker", width=30,
+                   command=self._open_tracker).pack(pady=6)
         ttk.Button(frame, text="Am I Good To Delete? / Validate cloud", width=30,
                    command=self._open_deletion_check).pack(pady=6)
         ttk.Button(frame, text="Download from cloud", width=30,
@@ -1839,6 +1989,9 @@ class App(tk.Tk):
 
     def _open_download(self):
         DownloadDialog(self, on_start=self._start_download)
+
+    def _open_tracker(self):
+        UploadTrackerDialog(self)
 
     def _start_download(self, manifests: list[dict], destination: Path):
         self._mode = "download"
@@ -3103,6 +3256,318 @@ class DownloadDialog(tk.Toplevel):
             return
         self.destroy()
         self.on_start(chosen, dest_path)
+
+
+# --- upload tracker dialog ---------------------------------------------------
+
+
+class UploadTrackerDialog(tk.Toplevel):
+    """Master view of every upload the tool has recorded (via the
+    _uploads_index.json blob). Grouped by feeder, sorted by most-recent
+    activity, with a take-over resume flow so a second pilot who never had
+    the local manifest can point at where the files are on their system
+    and continue an upload."""
+
+    ENTRY_COLS = ("kind", "date", "pilot", "systems", "progress", "updated")
+
+    def __init__(self, parent: App):
+        super().__init__(parent)
+        self.title("Upload tracker")
+        self.geometry("1080x680")
+        self.parent_app = parent
+
+        self.transient(parent)
+        self.lift()
+        self.attributes("-topmost", True)
+        self.after(300, lambda: self.attributes("-topmost", False))
+        self.focus_force()
+        self.grab_set()
+
+        self.client_var = tk.StringVar(value=VALID_CLIENTS[0])
+        self.program_var = tk.StringVar(value=VALID_PROGRAMS[0])
+        self.search_var = tk.StringVar()
+        self.search_var.trace_add("write", lambda *_: self._refill())
+        self._entries: list[dict] = []
+
+        top = ttk.Frame(self, padding=8)
+        top.pack(fill="x")
+        ttk.Label(top, text="Client").pack(side="left")
+        ttk.Combobox(top, textvariable=self.client_var, values=VALID_CLIENTS,
+                     state="readonly", width=10).pack(side="left", padx=4)
+        ttk.Label(top, text="Program").pack(side="left", padx=(10, 0))
+        ttk.Combobox(top, textvariable=self.program_var, values=VALID_PROGRAMS,
+                     state="readonly", width=8).pack(side="left", padx=4)
+        ttk.Button(top, text="Load", command=self._load).pack(side="left", padx=(10, 4))
+        ttk.Button(top, text="Refresh from cloud (rescan all feeders)",
+                   command=self._rebuild).pack(side="left", padx=4)
+        ttk.Label(top, text="Search").pack(side="left", padx=(20, 4))
+        ttk.Entry(top, textvariable=self.search_var, width=30).pack(side="left")
+
+        tree_frame = ttk.Frame(self)
+        tree_frame.pack(fill="both", expand=True, padx=8, pady=6)
+        self.tree = ttk.Treeview(tree_frame, columns=self.ENTRY_COLS,
+                                 show="tree headings", height=20)
+        self.tree.heading("#0", text="Feeder")
+        self.tree.column("#0", width=140, anchor="w")
+        widths = (80, 100, 140, 200, 110, 170)
+        for col, w in zip(self.ENTRY_COLS, widths):
+            self.tree.heading(col, text=col.title())
+            self.tree.column(col, width=w, anchor="w")
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        self.tree.tag_configure("complete", background="#c9f2c9")
+        self.tree.tag_configure("partial", background="#fff2c9")
+        self.tree.tag_configure("empty", background="#f2c9c9")
+        self.tree.bind("<Double-1>", lambda _e: self._resume_selected())
+
+        btns = ttk.Frame(self, padding=8)
+        btns.pack(fill="x")
+        ttk.Button(btns, text="Resume selected", command=self._resume_selected).pack(side="left")
+        ttk.Button(btns, text="Close", command=self.destroy).pack(side="right")
+
+        self.status_var = tk.StringVar(value="")
+        ttk.Label(self, textvariable=self.status_var).pack(anchor="w", padx=8, pady=(0, 6))
+
+        self._load()
+
+    # ---- loading ----
+
+    def _load(self):
+        self.status_var.set("Loading master index...")
+        self.tree.delete(*self.tree.get_children())
+        client = self.client_var.get()
+        program = self.program_var.get()
+        def worker():
+            try:
+                idx = load_master_index(client, program)
+            except Exception as e:
+                self.after(0, lambda: self.status_var.set(f"Failed to load index: {e}"))
+                return
+            entries = idx.get("entries") or []
+            self.after(0, lambda: self._apply(entries))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _rebuild(self):
+        if not messagebox.askyesno(
+            "Rebuild index",
+            f"Rescan every valid feeder ({len(VALID_FEEDERS)}) and rewrite "
+            f"the master index from scratch? This can be slow on a bad link.",
+        ):
+            return
+        client = self.client_var.get()
+        program = self.program_var.get()
+        self.status_var.set("Rebuilding: scanning feeders...")
+        def prog(i, total, feeder):
+            self.after(0, lambda: self.status_var.set(
+                f"Rebuilding {i}/{total}: {feeder}"))
+        def worker():
+            try:
+                idx = rebuild_master_index(client, program, progress_cb=prog)
+            except Exception as e:
+                self.after(0, lambda: self.status_var.set(f"Rebuild failed: {e}"))
+                return
+            entries = idx.get("entries") or []
+            self.after(0, lambda: (self._apply(entries),
+                                    self.status_var.set(
+                                        f"Rebuilt. {len(entries)} manifest(s) indexed.")))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply(self, entries: list[dict]):
+        self._entries = entries
+        self._refill()
+
+    def _refill(self):
+        self.tree.delete(*self.tree.get_children())
+        q = self.search_var.get().strip().lower()
+        # group by feeder
+        by_feeder: dict[str, list[dict]] = {}
+        for e in self._entries:
+            blob = " ".join(str(e.get(k, "")) for k in
+                            ("feeder", "kind", "collection_date", "pilot_name",
+                             "system_name")).lower()
+            blob += " " + " ".join(e.get("pilots") or []).lower()
+            blob += " " + " ".join(e.get("systems") or []).lower()
+            if q and q not in blob:
+                continue
+            by_feeder.setdefault(e["feeder"], []).append(e)
+        # sort feeders by max updated_utc desc
+        def _max_upd(entries):
+            return max((e.get("updated_utc") or "" for e in entries), default="")
+        feeders = sorted(by_feeder.items(), key=lambda kv: _max_upd(kv[1]), reverse=True)
+        shown = 0
+        for feeder, entries in feeders:
+            entries.sort(key=lambda e: e.get("updated_utc") or "", reverse=True)
+            parent = self.tree.insert("", "end", text=f"{feeder}  ({len(entries)})",
+                                       open=True)
+            for e in entries:
+                total = int(e.get("total") or 0)
+                verified = int(e.get("verified") or 0)
+                if total == 0:
+                    tag = "empty"
+                    progress = "empty"
+                elif verified == total:
+                    tag = "complete"
+                    progress = f"{verified}/{total}"
+                else:
+                    tag = "partial"
+                    progress = f"{verified}/{total}"
+                systems = ", ".join(e.get("systems") or [])
+                pilots_join = ", ".join(e.get("pilots") or [])
+                pilot = e.get("pilot_name") or ""
+                if pilots_join and pilots_join != pilot:
+                    pilot = f"{pilot} (+ {pilots_join})"
+                iid = e["manifest_blob_path"]
+                self.tree.insert(parent, "end", iid=iid, tags=(tag,), values=(
+                    e.get("kind"),
+                    e.get("collection_date"),
+                    pilot,
+                    systems,
+                    progress,
+                    (e.get("updated_utc") or "")[:19].replace("T", " "),
+                ))
+                shown += 1
+        self.status_var.set(f"{shown} manifest(s) across {len(feeders)} feeder(s).")
+
+    # ---- resume / take-over ----
+
+    def _resume_selected(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showerror("Pick a row", "Select a manifest row (not a feeder header).")
+            return
+        iid = sel[0]
+        entry = next((e for e in self._entries if e["manifest_blob_path"] == iid), None)
+        if not entry:
+            messagebox.showerror("Pick a row", "That's a feeder header; pick one of its rows.")
+            return
+        TakeoverDialog(self, entry, on_ready=self._start_after_takeover)
+
+    def _start_after_takeover(self, m: dict, path: Path):
+        self.destroy()
+        self.parent_app._start_session([(m, path)])
+
+
+class TakeoverDialog(tk.Toplevel):
+    """Show the manifest header, ask for a local source root + pilot name,
+    then adopt any pending items that match under that root and start the
+    session in resume mode. Items whose sources still can't be found stay
+    marked with their original system_name and get skipped by the zipper
+    ('owned by other system')."""
+
+    def __init__(self, parent, entry: dict, on_ready):
+        super().__init__(parent)
+        self.title("Take over upload")
+        self.geometry("720x360")
+        self.on_ready = on_ready
+        self.entry = entry
+
+        self.transient(parent)
+        self.lift()
+        self.attributes("-topmost", True)
+        self.after(200, lambda: self.attributes("-topmost", False))
+        self.focus_force()
+        self.grab_set()
+
+        header = ttk.LabelFrame(self, text="Manifest")
+        header.pack(fill="x", padx=10, pady=(10, 4))
+        ttk.Label(header, text=f"Feeder:  {entry.get('feeder')}").pack(anchor="w", padx=6)
+        ttk.Label(header, text=f"Kind:  {entry.get('kind')}").pack(anchor="w", padx=6)
+        ttk.Label(header, text=f"Collection date:  {entry.get('collection_date')}").pack(anchor="w", padx=6)
+        ttk.Label(header, text=f"Progress:  {entry.get('verified')}/{entry.get('total')} verified").pack(anchor="w", padx=6)
+        ttk.Label(header, text=f"Original pilot:  {entry.get('pilot_name')}").pack(anchor="w", padx=6)
+        ttk.Label(header, text=f"Manifest path:  {entry.get('manifest_blob_path')}").pack(anchor="w", padx=6, pady=(0, 4))
+
+        form = ttk.Frame(self, padding=10)
+        form.pack(fill="x")
+        ttk.Label(form, text="Your name").grid(row=0, column=0, sticky="w", pady=4)
+        self.pilot_var = tk.StringVar()
+        AutocompleteCombobox(form, VALID_PILOTS, textvariable=self.pilot_var,
+                             state="normal").grid(row=0, column=1, sticky="ew", padx=6)
+        ttk.Label(form, text="Local source root").grid(row=1, column=0, sticky="w", pady=4)
+        self.src_var = tk.StringVar()
+        ttk.Entry(form, textvariable=self.src_var).grid(row=1, column=1, sticky="ew", padx=6)
+        ttk.Button(form, text="Browse", command=self._browse).grid(row=1, column=2)
+        form.columnconfigure(1, weight=1)
+        ttk.Label(form, foreground="#666666", wraplength=680,
+                  text=("For sensor manifests, point at the folder that "
+                        "contains the mission subfolders (e.g. the SD card "
+                        "root). For base station, point at the folder that "
+                        "contains the .dat files. Items whose folder / file "
+                        "isn't found under this root will be left untouched; "
+                        "you can Take over later from another machine.")
+                  ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+        btns = ttk.Frame(self, padding=10)
+        btns.pack(fill="x")
+        ttk.Button(btns, text="Take over and resume", command=self._go).pack(side="right")
+        ttk.Button(btns, text="Cancel", command=self.destroy).pack(side="right", padx=6)
+
+    def _browse(self):
+        d = filedialog.askdirectory(title="Select the folder that contains the mission subfolders / .dat files")
+        if d:
+            self.src_var.set(d)
+
+    def _go(self):
+        pilot = self.pilot_var.get().strip()
+        if not pilot:
+            messagebox.showerror("Missing pilot", "Enter your name first.")
+            return
+        src = self.src_var.get().strip()
+        try:
+            m = load_cloud_manifest_at(self.entry["manifest_blob_path"])
+        except Exception as e:
+            messagebox.showerror("Load failed", str(e))
+            return
+        if not m:
+            messagebox.showerror("Not found",
+                                 "That manifest no longer exists on the cloud.")
+            return
+        adopted = _adopt_items(m, Path(src) if src else None, pilot)
+        m["pilot_name"] = pilot  # top-level = new writer
+        # Fresh top-level session_id so tracker + Am-I-Good-To-Delete? see
+        # THIS pilot's slice; existing items retain their original per-item
+        # session_id / pilot_name for provenance.
+        m["session_id"] = str(uuid.uuid4())
+        path = default_local_path(m["feeder"], m["kind"], m["collection_date"], m["session_id"])
+        save_local_manifest(m, path)
+        n_left = sum(1 for it in m["items"].values()
+                     if it.get("status") != STATUS_VERIFIED)
+        messagebox.showinfo(
+            "Ready to resume",
+            f"Adopted {adopted} of {n_left} unfinished item(s) at:\n{src or '(none)'}\n\n"
+            f"Local manifest saved to:\n{path}\n\n"
+            f"Starting the upload session now."
+        )
+        self.destroy()
+        self.on_ready(m, path)
+
+
+def _adopt_items(m: dict, source_root: Path | None, current_pilot: str) -> int:
+    """Rewrite item paths in ``m`` to point under ``source_root`` where a
+    matching name is found there, and update system_name to the current
+    machine so the session zipper actually picks them up. Returns the
+    number of items adopted. Verified items are not touched."""
+    if source_root is None or not source_root.exists():
+        return 0
+    if m["kind"] == KIND_SENSOR:
+        candidates = {p.name: p for p in source_root.iterdir() if p.is_dir()}
+    else:
+        candidates = {p.name: p for p in source_root.iterdir() if p.is_file()}
+    current_system = get_system_name()
+    adopted = 0
+    for name, item in m["items"].items():
+        if item.get("status") == STATUS_VERIFIED:
+            continue
+        match = candidates.get(name)
+        if not match:
+            continue
+        item["original_path"] = str(match)
+        item["system_name"] = current_system
+        item["disk_name"] = get_disk_name(match)
+        adopted += 1
+    return adopted
 
 
 # --- drive remap dialog ------------------------------------------------------
