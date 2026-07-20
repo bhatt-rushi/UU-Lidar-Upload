@@ -93,6 +93,7 @@ VALID_PILOTS = [
     "Timothy Powell",
     "Nathaniel Bailey",
     "Nick Mims",
+    "Christian McAlister",
 ]
 # Known feeder names. The wizard autocompletes against this list, but a pilot
 # can type a custom feeder for troubleshooting / one-offs (warning is emitted
@@ -108,7 +109,7 @@ VALID_FEEDERS = [
     "SOS071", "SOS072", "TAD081", "WSF062", "WSF065", "WSF073", "WSF074",
     "YLR081", "YLR082",
 ]
-SENSOR_CHOICES = [("L3", True), ("TV540", False), ("TVGO", False)]
+SENSOR_CHOICES = [("L3", True), ("TV540", True), ("TVGO", False)]
 
 DATA_TYPE_RAW = "RAW_SENSOR"
 DATA_TYPE_PROCESSED = "PROCESSED_SENSOR"
@@ -124,6 +125,12 @@ FEEDER_WARN_REGEX = re.compile(r"^[A-Z]{3}\d{3}$")  # warn-only
 MISSION_REGEX = re.compile(
     r"^DJI_(?P<Y>\d{4})(?P<M>\d{2})(?P<D>\d{2})(?P<h>\d{2})(?P<m>\d{2})"
     r"_(?P<seq>\d+)_(?P<feeder>[A-Z0-9]+)$"
+)
+# TV540 folder naming: @@YYYY-MM-DD-HHMMSS. Note the feeder is NOT in the
+# folder name for this sensor -- we have to trust the pilot's typed feeder
+# for filing under the right cloud path.
+TV540_MISSION_REGEX = re.compile(
+    r"^@@(?P<Y>\d{4})-(?P<M>\d{2})-(?P<D>\d{2})-(?P<h>\d{2})(?P<m>\d{2})(?P<s>\d{2})$"
 )
 BASE_STATION_DAT_REGEX = re.compile(
     r"^DRTK\d+_\d+_(?P<Y>\d{4})(?P<M>\d{2})(?P<D>\d{2})\d{6}_.+\.dat$",
@@ -452,22 +459,52 @@ def discover_dates_for_feeder(client: str, program: str,
 # --- validators --------------------------------------------------------------
 
 
-def scan_missions(source_root: Path, expected_feeder: str) -> tuple[list[dict], list[dict]]:
+def _mission_regex_for(sensor: str) -> re.Pattern:
+    if sensor == "TV540":
+        return TV540_MISSION_REGEX
+    return MISSION_REGEX  # L3 (and default)
+
+
+def scan_missions(source_root: Path, expected_feeder: str,
+                  sensor: str) -> tuple[list[dict], list[dict]]:
+    """Sensor-aware mission-folder scan.
+
+    L3:    strict feeder check via the DJI_..._FEEDER filename tail.
+    TV540: no feeder in the folder name, so we trust the pilot's typed
+           feeder and only validate the @@YYYY-MM-DD-HHMMSS shape. As
+           requested, anything else in the source root (loose files,
+           differently-named folders) is rejected instead of silently
+           ignored.
+    """
+    regex = _mission_regex_for(sensor)
+    check_feeder = sensor == "L3"
+    strict_reject_loose = sensor == "TV540"
     valid: list[dict] = []
     invalid: list[dict] = []
     for entry in sorted(source_root.iterdir()):
+        if entry.is_file():
+            if strict_reject_loose:
+                invalid.append({
+                    "name": entry.name,
+                    "reason": "loose file in source root -- only TV540 mission folders allowed",
+                })
+            continue
         if not entry.is_dir():
             continue
-        m = MISSION_REGEX.match(entry.name)
+        m = regex.match(entry.name)
         if not m:
-            invalid.append({"name": entry.name, "reason": "does not match DJI_YYYYMMDDHHMM_SEQ_FEEDER"})
+            if sensor == "TV540":
+                reason = "does not match @@YYYY-MM-DD-HHMMSS"
+            else:
+                reason = "does not match DJI_YYYYMMDDHHMM_SEQ_FEEDER"
+            invalid.append({"name": entry.name, "reason": reason})
             continue
         try:
             date = dt.date(int(m["Y"]), int(m["M"]), int(m["D"])).isoformat()
         except ValueError:
             invalid.append({"name": entry.name, "reason": "invalid date in folder name"})
             continue
-        if m["feeder"] != expected_feeder:
+        if check_feeder and m["feeder"] != expected_feeder:
             invalid.append({
                 "name": entry.name,
                 "reason": f"feeder in folder ({m['feeder']}) != entered feeder ({expected_feeder})",
@@ -478,18 +515,19 @@ def scan_missions(source_root: Path, expected_feeder: str) -> tuple[list[dict], 
             "name": entry.name,
             "path": str(entry),
             "date": date,
-            "seq": m["seq"],
-            "feeder": m["feeder"],
+            "seq": m["seq"] if "seq" in m.groupdict() else "",
+            "feeder": expected_feeder if not check_feeder else m["feeder"],
             "file_count": file_count,
         })
     return valid, invalid
 
 
-def detect_data_type(source_root: Path) -> str | None:
+def detect_data_type(source_root: Path, sensor: str) -> str | None:
+    regex = _mission_regex_for(sensor)
     has_missions = False
     has_processed = False
     for entry in source_root.iterdir():
-        if entry.is_dir() and MISSION_REGEX.match(entry.name):
+        if entry.is_dir() and regex.match(entry.name):
             has_missions = True
         elif entry.is_file() and entry.suffix.lower() in PROCESSED_EXTS:
             has_processed = True
@@ -2309,28 +2347,39 @@ class NewUploadWizard(tk.Toplevel):
 
         sensor_by_date: dict[str, list[dict]] = {}
         data_type: str | None = None
+        sensor = self.sensor_var.get()
         if self.upload_sensor_var.get():
             src = self.source_var.get().strip()
             if not src or not Path(src).is_dir():
                 messagebox.showerror("Bad source", "Pick a valid sensor source folder.")
                 return
             root = Path(src)
-            data_type = detect_data_type(root)
+            data_type = detect_data_type(root, sensor)
             if data_type is None:
+                mission_shape = ("@@YYYY-MM-DD-HHMMSS folders" if sensor == "TV540"
+                                 else "DJI_* mission folders")
                 messagebox.showerror(
                     "Mixed / empty",
-                    "Sensor source must be either raw DJI_* mission folders OR .las/.laz files, not both.",
+                    f"Sensor source must be either raw {mission_shape} OR .las/.laz files, not both.",
                 )
                 return
-            self._report(f"Detected data type: {data_type}")
+            self._report(f"Detected data type: {data_type} (sensor={sensor})")
+            if sensor == "TV540":
+                # No feeder in the folder name for TV540 -- extra reminder
+                # since we can't cross-check what the pilot typed.
+                self._report(
+                    "NOTE: TV540 folder names don't encode the feeder. "
+                    f"All missions will be filed under '{feeder}' -- verify it's right."
+                )
             if data_type == DATA_TYPE_RAW:
-                valid, invalid = scan_missions(root, feeder)
+                valid, invalid = scan_missions(root, feeder, sensor)
                 if invalid:
-                    self._report("Invalid mission folder names -- fix, rename, or remove and re-scan:")
+                    self._report("Invalid entries in source root -- fix, rename, or remove and re-scan:")
                     for i in invalid:
                         self._report(f"  {i['name']}: {i['reason']}")
-                    messagebox.showwarning("Invalid names",
-                        "One or more mission folders are invalid. See report; fix and re-scan.")
+                    messagebox.showwarning("Invalid entries",
+                        "One or more entries in the source root are invalid. "
+                        "See report; fix and re-scan.")
                     return
                 for m in valid:
                     sensor_by_date.setdefault(m["date"], []).append(m)
