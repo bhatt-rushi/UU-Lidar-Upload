@@ -136,14 +136,20 @@ BASE_STATION_DAT_REGEX = re.compile(
     r"^DRTK\d+_\d+_(?P<Y>\d{4})(?P<M>\d{2})(?P<D>\d{2})\d{6}_.+\.dat$",
     re.IGNORECASE,
 )
-# RINEX 2 observation-file extension: two digits (the year) followed by 'o'.
-# e.g. .26o, .25o. Case-insensitive per RINEX convention.
-RINEX_OBS_EXT_REGEX = re.compile(r"\.\d{2}[oO]$")
-# In a RINEX 2 header the "PGM / RUN BY / DATE" line carries the run date in
-# DD-MM-YY form (CHC Navigation format). We grep for the first DD-MM-YY on
-# that line rather than relying on fixed columns since receivers pad
-# differently.
-RINEX_HEADER_DATE_REGEX = re.compile(r"(\d{2})-(\d{2})-(\d{2})")
+# RINEX observation-file extension. Accept both the short-name form
+# (.YYo -- two-digit year + 'o', e.g. .26o, .25o) and the RINEX 3 long-name
+# form (.rnx). Case-insensitive per RINEX convention.
+RINEX_OBS_EXT_REGEX = re.compile(r"\.(?:\d{2}[oO]|rnx)$", re.IGNORECASE)
+# Formats seen on the "PGM / RUN BY / DATE" line in RINEX 3 headers, tried
+# in order:
+#   1. YYYYMMDD HHMMSS <ZONE>   -- RINEX 3.02 / 3.04 spec
+#   2. DD-MMM-YY HH:MM          -- some vendors, month as 3-letter name
+#   3. DD-MM-YY HH:MM           -- CHC Navigation
+RINEX_HEADER_DATE_YMD = re.compile(r"(\d{8})\s")
+RINEX_HEADER_DATE_DMMMYY = re.compile(r"(\d{2})-([A-Za-z]{3})-(\d{2})")
+RINEX_HEADER_DATE_DMY = re.compile(r"(\d{2})-(\d{2})-(\d{2})")
+_RINEX_MONTHS = ["jan", "feb", "mar", "apr", "may", "jun",
+                 "jul", "aug", "sep", "oct", "nov", "dec"]
 BASE_STATION_INDEX_NAMES = {"latest_index", "latest_index.txt"}
 
 PROCESSED_EXTS = {".las", ".laz"}
@@ -548,10 +554,39 @@ def detect_data_type(source_root: Path, sensor: str) -> str | None:
     return None
 
 
+def _parse_rinex_header_date(line: str) -> str | None:
+    """Try the three date formats we've seen on the RINEX 3 PGM/RUN BY/DATE
+    line, in order of specificity."""
+    m = RINEX_HEADER_DATE_YMD.search(line)
+    if m:
+        s = m.group(1)
+        try:
+            return dt.date(int(s[:4]), int(s[4:6]), int(s[6:8])).isoformat()
+        except ValueError:
+            pass
+    m = RINEX_HEADER_DATE_DMMMYY.search(line)
+    if m:
+        dd, mmm, yy = m.groups()
+        try:
+            mm = _RINEX_MONTHS.index(mmm.lower()) + 1
+            return dt.date(2000 + int(yy), mm, int(dd)).isoformat()
+        except (ValueError, IndexError):
+            pass
+    m = RINEX_HEADER_DATE_DMY.search(line)
+    if m:
+        dd, mm, yy = m.groups()
+        try:
+            return dt.date(2000 + int(yy), int(mm), int(dd)).isoformat()
+        except ValueError:
+            pass
+    return None
+
+
 def parse_rinex_obs_date(path: Path) -> str | None:
-    """Read a RINEX 2 observation file's header and pull the run date off
-    the "PGM / RUN BY / DATE" line, which carries DD-MM-YY in the CHC
-    Navigation format. Returns 'YYYY-MM-DD' or None if we can't find it.
+    """Read a RINEX 3 observation file's header and pull the run date off
+    the "PGM / RUN BY / DATE" line. The RINEX 3.02/3.04 spec uses
+    YYYYMMDD HHMMSS but real receivers (notably CHC Navigation) emit
+    DD-MM-YY HH:MM. Returns 'YYYY-MM-DD' or None if we can't find it.
     Reads only the header (up to 60 lines or 'END OF HEADER')."""
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
@@ -560,16 +595,7 @@ def parse_rinex_obs_date(path: Path) -> str | None:
                 if not line:
                     break
                 if "PGM / RUN BY / DATE" in line:
-                    m = RINEX_HEADER_DATE_REGEX.search(line)
-                    if not m:
-                        return None
-                    dd, mm, yy = m.groups()
-                    try:
-                        # 2-digit year -> assume 20YY (safe for this decade
-                        # and matches how the base stations are configured).
-                        return dt.date(2000 + int(yy), int(mm), int(dd)).isoformat()
-                    except ValueError:
-                        return None
+                    return _parse_rinex_header_date(line)
                 if "END OF HEADER" in line:
                     return None
     except Exception:
