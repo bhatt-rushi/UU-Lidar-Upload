@@ -2220,8 +2220,11 @@ class App(tk.Tk):
                    command=self._start_new_wizard).pack(pady=6)
         ttk.Button(frame, text="Resume from manifest... (adds to queue)", width=40,
                    command=self._start_resume).pack(pady=6)
-        qbtn_label = f"Upload queue ({len(self.queue.paths())} pending)"
-        ttk.Button(frame, text=qbtn_label, width=40,
+        # Bound to a StringVar so it stays fresh as items are added / removed
+        # without needing to rebuild the whole start frame.
+        self.queue_btn_var = tk.StringVar(
+            value=f"Upload queue ({len(self.queue.paths())} pending)")
+        ttk.Button(frame, textvariable=self.queue_btn_var, width=40,
                    command=self._open_queue).pack(pady=6)
         ttk.Button(frame, text="Uploads (browse / download / resume)", width=40,
                    command=self._open_uploads).pack(pady=6)
@@ -2243,12 +2246,23 @@ class App(tk.Tk):
     def _open_queue(self):
         QueueDialog(self)
 
+    def _refresh_queue_count(self):
+        """Keep the main-menu Upload Queue button in sync with the queue
+        whenever items are added, removed, or pruned. No-op if the start
+        frame isn't currently on screen."""
+        try:
+            self.queue_btn_var.set(
+                f"Upload queue ({len(self.queue.paths())} pending)")
+        except Exception:
+            pass
+
     def _enqueue(self, manifests: list[tuple[dict, Path]]):
         """Add manifests to the queue (paths only; the manifest JSON is on
         disk in the registry). Offer to open the queue or start processing
         right away."""
         for _m, p in manifests:
             self.queue.append(str(p))
+        self._refresh_queue_count()
         n = len(manifests)
         total = len(self.queue.paths())
         if messagebox.askyesno(
@@ -2397,6 +2411,7 @@ class App(tk.Tk):
                     if items and all(it.get("status") == STATUS_VERIFIED
                                      for it in items.values()):
                         self.queue.remove(str(p))
+                self._refresh_queue_count()
             messagebox.showinfo("Finished" if ok else "Stopped", msg)
         self.after(0, apply)
 
@@ -2569,7 +2584,7 @@ class NewUploadWizard(tk.Toplevel):
         btns = ttk.Frame(self)
         btns.grid(row=row, column=0, columnspan=3, sticky="ew", padx=8, pady=8)
         ttk.Button(btns, text="Scan / validate", command=self._scan).pack(side="left")
-        ttk.Button(btns, text="Start upload", command=self._confirm_start).pack(side="right")
+        ttk.Button(btns, text="Add to queue", command=self._confirm_start).pack(side="right")
         ttk.Button(btns, text="Cancel", command=self.destroy).pack(side="right", padx=6)
 
         self.scanned: dict | None = None
@@ -2726,7 +2741,7 @@ class NewUploadWizard(tk.Toplevel):
             "sensor_by_date": sensor_by_date,
             "base_info": base_info,
         }
-        self._report("Scan OK. Press 'Start upload' to begin.")
+        self._report("Scan OK. Press 'Add to queue' to add these manifests.")
 
     def _preview_cloud_merge(self, kind: str, client: str, program: str,
                               feeder: str, collection_date: str,
@@ -3964,6 +3979,7 @@ class QueueDialog(tk.Toplevel):
         if not p:
             return
         self.queue.move(p, delta)
+        self.parent_app._refresh_queue_count()
         self._reload()
         # keep the moved row selected so the pilot can spam the button
         if p in self.tree.get_children():
@@ -3981,6 +3997,7 @@ class QueueDialog(tk.Toplevel):
         ):
             return
         self.queue.remove(p)
+        self.parent_app._refresh_queue_count()
         self._reload()
 
     def _start(self):
@@ -4003,6 +4020,7 @@ class QueueDialog(tk.Toplevel):
             if items and all(it.get("status") == STATUS_VERIFIED for it in items.values()):
                 # already complete; drop it from the queue silently
                 self.queue.remove(p)
+                self.parent_app._refresh_queue_count()
                 continue
             avail = manifest_availability(m)
             if avail["pending"] > 0 and avail["present"] == 0:
