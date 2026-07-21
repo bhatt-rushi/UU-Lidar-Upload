@@ -1657,6 +1657,20 @@ def _fmt_rate(bps: float) -> str:
     return _fmt_bytes(int(bps)) + "/s"
 
 
+def _fmt_local_time(ts_utc: str) -> str:
+    """Render a stored '...Z' UTC timestamp in the local system timezone,
+    12-hour with AM/PM. Falls back to the raw '[:19]' UTC form if parsing
+    fails so the column never goes blank."""
+    if not ts_utc:
+        return ""
+    try:
+        core = ts_utc.rstrip("Z")
+        d = dt.datetime.fromisoformat(core).replace(tzinfo=dt.timezone.utc)
+        return d.astimezone().strftime("%Y-%m-%d %I:%M:%S %p")
+    except Exception:
+        return ts_utc[:19].replace("T", " ")
+
+
 def _fmt_eta(secs: float | None) -> str:
     if secs is None or secs <= 0:
         return "--"
@@ -2807,7 +2821,7 @@ class DeletionCheckDialog(tk.Toplevel):
                 m.get("collection_date", "?"),
                 m.get("pilot_name", "?"),
                 verified,
-                m.get("updated_utc", "")[:19].replace("T", " "),
+                _fmt_local_time(m.get("updated_utc", "")),
             ))
 
     def _open_registry_folder(self):
@@ -3118,7 +3132,7 @@ class ResumeDialog(tk.Toplevel):
                 m.get("collection_date", "?"),
                 m.get("pilot_name", "?"),
                 verified,
-                m.get("updated_utc", "")[:19].replace("T", " "),
+                _fmt_local_time(m.get("updated_utc", "")),
             ))
 
     def _resume_selected(self):
@@ -3452,7 +3466,7 @@ class UploadsBrowserDialog(tk.Toplevel):
                         systems,
                         progress,
                         base_text,
-                        (e.get("updated_utc") or "")[:19].replace("T", " "),
+                        _fmt_local_time(e.get("updated_utc") or ""),
                     ))
                     shown += 1
         self.status_var.set(
