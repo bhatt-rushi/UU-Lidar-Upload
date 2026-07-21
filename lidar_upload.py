@@ -923,6 +923,114 @@ def list_registered_manifests() -> list[Path]:
     return sorted(registry_dir().glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
 
 
+# --- upload queue ------------------------------------------------------------
+#
+# A persistent, ordered list of local-manifest paths so pilots can stack up
+# multiple days / feeders / sensors, close the app, and pick back up. Lives
+# in the same well-known place as the manifest registry so a system reboot
+# doesn't lose it.
+
+QUEUE_VERSION = 1
+
+
+def queue_file_path() -> Path:
+    """Where the queue lives on disk. Sibling of the manifest registry."""
+    return registry_dir().parent / "queue.json"
+
+
+class UploadQueue:
+    """Ordered list of local manifest paths, persisted to queue.json.
+
+    Deduplicates by path on load and save. Every mutating op saves
+    immediately (atomic rename) so a crash mid-edit can't leave a half-
+    written file.
+    """
+
+    def __init__(self):
+        self.path = queue_file_path()
+        self._paths: list[str] = []
+        self.load()
+
+    def load(self):
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            raw = [p for p in (data.get("manifest_paths") or [])
+                   if isinstance(p, str)]
+        except (FileNotFoundError, json.JSONDecodeError):
+            raw = []
+        except Exception:
+            raw = []
+        seen: set[str] = set()
+        self._paths = []
+        for p in raw:
+            if p in seen:
+                continue
+            seen.add(p)
+            self._paths.append(p)
+
+    def save(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        tmp.write_text(
+            json.dumps({"version": QUEUE_VERSION,
+                        "manifest_paths": self._paths},
+                       indent=2),
+            encoding="utf-8",
+        )
+        tmp.replace(self.path)
+
+    def paths(self) -> list[str]:
+        return list(self._paths)
+
+    def append(self, mp: str):
+        if mp not in self._paths:
+            self._paths.append(mp)
+            self.save()
+
+    def remove(self, mp: str):
+        if mp in self._paths:
+            self._paths.remove(mp)
+            self.save()
+
+    def move(self, mp: str, delta: int):
+        """Move mp up (delta<0) or down (delta>0) within the queue."""
+        if mp not in self._paths or delta == 0:
+            return
+        idx = self._paths.index(mp)
+        new_idx = max(0, min(len(self._paths) - 1, idx + delta))
+        if new_idx == idx:
+            return
+        self._paths.pop(idx)
+        self._paths.insert(new_idx, mp)
+        self.save()
+
+    def clear(self):
+        self._paths.clear()
+        self.save()
+
+
+def manifest_availability(m: dict) -> dict:
+    """Count how many non-verified items in ``m`` still have their source on
+    disk. A manifest with pending > 0 and present == 0 is a queue item we
+    can't work on right now (drive disconnected, moved, etc.) and should
+    skip. Returns {"pending", "present", "missing", "verified"}."""
+    pending = 0
+    present = 0
+    verified = 0
+    for item in m.get("items", {}).values():
+        if item.get("status") == STATUS_VERIFIED:
+            verified += 1
+            continue
+        pending += 1
+        try:
+            if Path(item.get("original_path", "")).exists():
+                present += 1
+        except Exception:
+            pass
+    return {"pending": pending, "present": present,
+            "missing": pending - present, "verified": verified}
+
+
 def default_local_path(feeder: str, kind: str, collection_date: str, session_id: str) -> Path:
     stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     subdir = "sensor" if kind == KIND_SENSOR else "base"
@@ -2078,6 +2186,10 @@ class App(tk.Tk):
         self.geometry("900x680")
         self.advanced = dict(DEFAULT_ADVANCED)
         self.session: UploadSession | None = None
+        self.queue = UploadQueue()
+        # Paths of manifests handed to the currently-running session; used
+        # to prune the queue on completion (verified manifests get removed).
+        self._session_paths: list[Path] = []
         self._build_start()
 
     def _clear(self):
@@ -2098,10 +2210,13 @@ class App(tk.Tk):
                   foreground="black" if azcopy_path().exists() else "red").pack(pady=2)
 
         ttk.Separator(frame).pack(fill="x", pady=14)
-        ttk.Button(frame, text="New upload", width=40,
+        ttk.Button(frame, text="New upload (adds to queue)", width=40,
                    command=self._start_new_wizard).pack(pady=6)
-        ttk.Button(frame, text="Resume from manifest...", width=40,
+        ttk.Button(frame, text="Resume from manifest... (adds to queue)", width=40,
                    command=self._start_resume).pack(pady=6)
+        qbtn_label = f"Upload queue ({len(self.queue.paths())} pending)"
+        ttk.Button(frame, text=qbtn_label, width=40,
+                   command=self._open_queue).pack(pady=6)
         ttk.Button(frame, text="Uploads (browse / download / resume)", width=40,
                    command=self._open_uploads).pack(pady=6)
         ttk.Button(frame, text="Am I Good To Delete? / Validate cloud", width=40,
@@ -2119,6 +2234,29 @@ class App(tk.Tk):
     def _open_uploads(self):
         UploadsBrowserDialog(self)
 
+    def _open_queue(self):
+        QueueDialog(self)
+
+    def _enqueue(self, manifests: list[tuple[dict, Path]]):
+        """Add manifests to the queue (paths only; the manifest JSON is on
+        disk in the registry). Offer to open the queue or start processing
+        right away."""
+        for _m, p in manifests:
+            self.queue.append(str(p))
+        n = len(manifests)
+        total = len(self.queue.paths())
+        if messagebox.askyesno(
+            "Added to queue",
+            f"Added {n} manifest(s) to the upload queue "
+            f"({total} in queue total).\n\nOpen the queue now?",
+        ):
+            self._open_queue()
+
+    def _process_queue(self, manifests: list[tuple[dict, Path]]):
+        """Kick off an UploadSession with a pre-validated list. Called from
+        QueueDialog after it's checked availability."""
+        self._start_session(manifests)
+
     def _start_download(self, manifests: list[dict], destination: Path):
         self._mode = "download"
         self._build_progress()
@@ -2134,10 +2272,13 @@ class App(tk.Tk):
         session.start()
 
     def _start_new_wizard(self):
-        NewUploadWizard(self, on_ready=self._start_session)
+        NewUploadWizard(self, on_ready=self._enqueue)
 
     def _start_session(self, manifests: list[tuple[dict, Path]]):
         self._mode = "upload"
+        # Remember what we handed off so _done can prune the queue of any
+        # manifests that finished fully verified.
+        self._session_paths = [p for _m, p in manifests]
         self._build_progress()
         session = UploadSession(
             manifests=manifests,
@@ -2157,7 +2298,7 @@ class App(tk.Tk):
         if remapped is False:
             return
         save_local_manifest(m, path)
-        self._start_session([(m, path)])
+        self._enqueue([(m, path)])
 
     # --- progress screen ---
 
@@ -2237,6 +2378,19 @@ class App(tk.Tk):
                 self.back_btn.state(["!disabled"])
             except Exception:
                 pass
+            # Prune the queue: any manifest that came out of this upload
+            # session fully verified is done and can leave the queue.
+            # Partial / failed manifests stay so the pilot can re-run.
+            if getattr(self, "_mode", "upload") == "upload":
+                for p in getattr(self, "_session_paths", []):
+                    try:
+                        m = load_local_manifest(p)
+                    except Exception:
+                        continue
+                    items = m.get("items", {}) or {}
+                    if items and all(it.get("status") == STATUS_VERIFIED
+                                     for it in items.values()):
+                        self.queue.remove(str(p))
             messagebox.showinfo("Finished" if ok else "Stopped", msg)
         self.after(0, apply)
 
@@ -3617,7 +3771,231 @@ class UploadsBrowserDialog(tk.Toplevel):
 
     def _start_after_takeover(self, m: dict, path: Path):
         self.destroy()
-        self.parent_app._start_session([(m, path)])
+        self.parent_app._enqueue([(m, path)])
+
+
+# --- upload queue dialog -----------------------------------------------------
+
+
+class QueueDialog(tk.Toplevel):
+    """Manage the persistent upload queue: view, reorder, remove, and
+    start processing. Each row shows the local manifest's identity plus a
+    per-manifest data-availability check (drive present? sources on
+    disk?) so a queue item added yesterday can be flagged today if the
+    drive is disconnected. Start Processing re-checks availability just
+    before handing manifests to the upload session; anything with no
+    reachable data is skipped with a warning listing what was skipped."""
+
+    COLS = ("pos", "feeder", "kind", "sensor", "date", "pilot",
+            "progress", "sources", "path")
+
+    def __init__(self, parent: App):
+        super().__init__(parent)
+        self.title("Upload queue")
+        self.geometry("1120x620")
+        self.parent_app = parent
+        self.queue = parent.queue
+
+        self.transient(parent)
+        self.lift()
+        self.attributes("-topmost", True)
+        self.after(300, lambda: self.attributes("-topmost", False))
+        self.focus_force()
+        self.grab_set()
+
+        top = ttk.Frame(self, padding=8)
+        top.pack(fill="x")
+        ttk.Label(top, text=f"Queue file:  {self.queue.path}").pack(anchor="w")
+
+        info = tk.Message(
+            self, width=1080, padx=8, pady=4,
+            text=(
+                "The queue processes manifests in the order shown. Use Up "
+                "/ Down to reorder, Remove to drop an item, Refresh to "
+                "re-check whether the source data is reachable right now. "
+                "On Start Processing, each item's data availability is "
+                "re-checked one more time; items whose sources aren't "
+                "present (drive disconnected, files moved) are skipped "
+                "and processing continues with the next item."
+            ),
+            foreground="#555555",
+        )
+        info.pack(fill="x", padx=8, pady=(0, 4))
+
+        tree_frame = ttk.Frame(self)
+        tree_frame.pack(fill="both", expand=True, padx=8, pady=6)
+        self.tree = ttk.Treeview(tree_frame, columns=self.COLS,
+                                  show="headings", selectmode="browse",
+                                  height=14)
+        widths = (40, 90, 70, 70, 100, 130, 90, 130, 260)
+        for col, w in zip(self.COLS, widths):
+            self.tree.heading(col, text=col.title())
+            self.tree.column(col, width=w, anchor="w")
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical",
+                             command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        self.tree.tag_configure("complete", background="#c9f2c9")
+        self.tree.tag_configure("partial", background="#fff2c9")
+        self.tree.tag_configure("no_data", background="#fddede")
+        self.tree.tag_configure("missing_file", background="#f2c9c9")
+
+        btns = ttk.Frame(self, padding=8)
+        btns.pack(fill="x")
+        ttk.Button(btns, text="Move up", command=lambda: self._move(-1)).pack(side="left")
+        ttk.Button(btns, text="Move down", command=lambda: self._move(1)).pack(side="left", padx=6)
+        ttk.Button(btns, text="Remove selected", command=self._remove).pack(side="left", padx=6)
+        ttk.Button(btns, text="Refresh", command=self._reload).pack(side="left", padx=6)
+        ttk.Button(btns, text="Start processing", command=self._start).pack(side="left", padx=18)
+        ttk.Button(btns, text="Close", command=self.destroy).pack(side="right")
+
+        self.status_var = tk.StringVar(value="")
+        ttk.Label(self, textvariable=self.status_var).pack(anchor="w", padx=8, pady=(0, 6))
+
+        self._reload()
+
+    def _reload(self):
+        self.tree.delete(*self.tree.get_children())
+        paths = self.queue.paths()
+        n_ok = 0
+        for i, p in enumerate(paths, start=1):
+            pp = Path(p)
+            if not pp.exists():
+                self.tree.insert("", "end", iid=p, tags=("missing_file",),
+                                 values=(i, "?", "?", "?", "?", "?",
+                                          "?", "manifest file missing", p))
+                continue
+            try:
+                m = load_local_manifest(pp)
+            except Exception as e:
+                self.tree.insert("", "end", iid=p, tags=("missing_file",),
+                                 values=(i, "?", "?", "?", "?", "?",
+                                          "?", f"load failed: {e}", p))
+                continue
+            items = m.get("items", {}) or {}
+            avail = manifest_availability(m)
+            total = len(items)
+            verified = avail["verified"]
+            if total == 0:
+                progress = "empty"
+                row_tag = "no_data"
+            elif verified == total:
+                progress = f"{verified}/{total}"
+                row_tag = "complete"
+            else:
+                progress = f"{verified}/{total}"
+                row_tag = "partial"
+            if avail["pending"] > 0 and avail["present"] == 0:
+                sources = f"NONE present (0/{avail['pending']})"
+                row_tag = "no_data"
+            elif avail["pending"] > 0 and avail["missing"] > 0:
+                sources = f"partial ({avail['present']}/{avail['pending']})"
+                if row_tag != "no_data":
+                    row_tag = "partial"
+                n_ok += 1
+            elif avail["pending"] == 0:
+                sources = "-"
+                n_ok += 1
+            else:
+                sources = f"all present ({avail['present']}/{avail['pending']})"
+                n_ok += 1
+            self.tree.insert("", "end", iid=p, tags=(row_tag,), values=(
+                i,
+                m.get("feeder", "?"),
+                m.get("kind", "?"),
+                m.get("sensor") or "-",
+                m.get("collection_date", "?"),
+                m.get("pilot_name") or "?",
+                progress,
+                sources,
+                p,
+            ))
+        self.status_var.set(
+            f"{len(paths)} item(s) in queue; {n_ok} ready to process."
+        )
+
+    def _selected_path(self) -> str | None:
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showerror("Pick a row", "Select a queue row first.")
+            return None
+        return sel[0]
+
+    def _move(self, delta: int):
+        p = self._selected_path()
+        if not p:
+            return
+        self.queue.move(p, delta)
+        self._reload()
+        # keep the moved row selected so the pilot can spam the button
+        if p in self.tree.get_children():
+            self.tree.selection_set(p)
+            self.tree.see(p)
+
+    def _remove(self):
+        p = self._selected_path()
+        if not p:
+            return
+        if not messagebox.askyesno(
+            "Remove from queue",
+            f"Remove this manifest from the upload queue?\n\n{p}\n\n"
+            f"The manifest file on disk is NOT deleted."
+        ):
+            return
+        self.queue.remove(p)
+        self._reload()
+
+    def _start(self):
+        # Re-check availability at start-time (drive may have popped in/out
+        # since Reload). Load each manifest; skip anything missing or with
+        # zero reachable sources.
+        ready: list[tuple[dict, Path]] = []
+        skipped: list[str] = []
+        for p in self.queue.paths():
+            pp = Path(p)
+            if not pp.exists():
+                skipped.append(f"{p}: manifest file missing")
+                continue
+            try:
+                m = load_local_manifest(pp)
+            except Exception as e:
+                skipped.append(f"{p}: load failed ({e})")
+                continue
+            items = m.get("items", {}) or {}
+            if items and all(it.get("status") == STATUS_VERIFIED for it in items.values()):
+                # already complete; drop it from the queue silently
+                self.queue.remove(p)
+                continue
+            avail = manifest_availability(m)
+            if avail["pending"] > 0 and avail["present"] == 0:
+                skipped.append(
+                    f"{p}: no source data reachable "
+                    f"(0/{avail['pending']} present)"
+                )
+                continue
+            ready.append((m, pp))
+        if skipped:
+            messagebox.showwarning(
+                "Some items will be skipped",
+                "These queue items will be skipped this run:\n\n" +
+                "\n".join(f"  - {s}" for s in skipped) +
+                "\n\nThey stay in the queue and can be re-tried later."
+            )
+        if not ready:
+            messagebox.showerror(
+                "Nothing to process",
+                "No queue items have reachable data right now."
+            )
+            return
+        if not messagebox.askyesno(
+            "Confirm processing",
+            f"Process {len(ready)} queue item(s) now?\n\nThe upload session "
+            f"will run them in order; you can Stop at any time."
+        ):
+            return
+        self.destroy()
+        self.parent_app._process_queue(ready)
 
 
 class TakeoverDialog(tk.Toplevel):
