@@ -3285,9 +3285,15 @@ class UploadsBrowserDialog(tk.Toplevel):
         btns.pack(fill="x")
         ttk.Button(btns, text="Download selected",
                     command=self._download).pack(side="left")
-        ttk.Button(btns, text="Resume selected",
-                    command=self._resume).pack(side="left", padx=6)
+        self.resume_btn = ttk.Button(btns, text="Resume selected",
+                                       command=self._resume)
+        self.resume_btn.pack(side="left", padx=6)
+        self.resume_btn.state(["disabled"])
         ttk.Button(btns, text="Close", command=self.destroy).pack(side="right")
+
+        # Enable Resume only for rows that actually have work left to do.
+        self.tree.bind("<<TreeviewSelect>>",
+                        lambda _e: self._refresh_action_states())
 
         self.status_var = tk.StringVar(value="")
         ttk.Label(self, textvariable=self.status_var).pack(anchor="w", padx=8, pady=(0, 6))
@@ -3460,6 +3466,26 @@ class UploadsBrowserDialog(tk.Toplevel):
 
     # ---- actions ----
 
+    def _refresh_action_states(self):
+        """Only enable Resume when the selected leaf has unfinished work."""
+        sel = self.tree.selection()
+        entry = None
+        if sel:
+            entry = next((e for e in self._entries
+                          if e["manifest_blob_path"] == sel[0]), None)
+        can_resume = False
+        if entry:
+            total = int(entry.get("total") or 0)
+            verified = int(entry.get("verified") or 0)
+            # Resume makes sense whenever there's something not yet verified.
+            # (total==0 also qualifies -- e.g. cloud manifest exists but no
+            # items yet; a pilot may want to take it over and repopulate.)
+            can_resume = (total == 0) or (verified < total)
+        if can_resume:
+            self.resume_btn.state(["!disabled"])
+        else:
+            self.resume_btn.state(["disabled"])
+
     def _selected_entry(self) -> dict | None:
         sel = self.tree.selection()
         if not sel:
@@ -3530,6 +3556,15 @@ class UploadsBrowserDialog(tk.Toplevel):
     def _resume(self):
         entry = self._selected_entry()
         if not entry:
+            return
+        total = int(entry.get("total") or 0)
+        verified = int(entry.get("verified") or 0)
+        if total > 0 and verified >= total:
+            messagebox.showerror(
+                "Nothing to resume",
+                "That upload is already complete -- every item is verified. "
+                "Use Download instead if you want to pull it down.",
+            )
             return
         TakeoverDialog(self, entry, on_ready=self._start_after_takeover)
 
