@@ -777,6 +777,7 @@ def build_index_entry(m: dict) -> dict:
     return {
         "feeder": m["feeder"],
         "kind": m["kind"],
+        "sensor": m.get("sensor"),              # None for base_station
         "collection_date": m["collection_date"],
         "manifest_blob_path": m["manifest_blob_path"],
         "pilot_name": m.get("pilot_name"),      # top-level = last writer
@@ -2087,12 +2088,10 @@ class App(tk.Tk):
                    command=self._start_new_wizard).pack(pady=6)
         ttk.Button(frame, text="Resume from manifest...", width=30,
                    command=self._start_resume).pack(pady=6)
-        ttk.Button(frame, text="Upload tracker", width=30,
-                   command=self._open_tracker).pack(pady=6)
+        ttk.Button(frame, text="Uploads (browse / download / resume)", width=30,
+                   command=self._open_uploads).pack(pady=6)
         ttk.Button(frame, text="Am I Good To Delete? / Validate cloud", width=30,
                    command=self._open_deletion_check).pack(pady=6)
-        ttk.Button(frame, text="Download from cloud", width=30,
-                   command=self._open_download).pack(pady=6)
         ttk.Button(frame, text="Advanced options...", width=30,
                    command=self._open_advanced).pack(pady=6)
         ttk.Button(frame, text="Exit", width=30, command=self.destroy).pack(pady=6)
@@ -2103,11 +2102,8 @@ class App(tk.Tk):
     def _open_deletion_check(self):
         DeletionCheckDialog(self)
 
-    def _open_download(self):
-        DownloadDialog(self, on_start=self._start_download)
-
-    def _open_tracker(self):
-        UploadTrackerDialog(self)
+    def _open_uploads(self):
+        UploadsBrowserDialog(self)
 
     def _start_download(self, manifests: list[dict], destination: Path):
         self._mode = "download"
@@ -3161,261 +3157,35 @@ class ResumeDialog(tk.Toplevel):
         self.on_pick(m, path)
 
 
-# --- download dialog ---------------------------------------------------------
+
+# --- uploads browser dialog -------------------------------------------------
+#
+# Merged replacement for the old separate DownloadDialog and
+# UploadTrackerDialog. Layout follows the Upload Tracker style (grouped
+# tree, colored rows) with a Date-under-Feeder second grouping level, a
+# base-station availability flag on each sensor row, and both actions on
+# the same page: Download selected (verified items -> local disk, zips
+# auto-extracted) and Resume selected (take-over via TakeoverDialog for
+# any in-progress upload).
 
 
-class DownloadDialog(tk.Toplevel):
-    """Discover what's available in the cloud for a valid feeder, show
-    per-(kind, date) completeness, let the pilot pick dates and a
-    destination, then hand the loaded manifests to the App to run a
-    DownloadSession. Only valid feeders and only date-shaped subfolders
-    are considered -- unrelated cruft in /lidardata/xcel/2026/ is
-    ignored."""
+class UploadsBrowserDialog(tk.Toplevel):
+    """Single browser for every upload the master index knows about.
 
-    COLUMNS = ("kind", "date", "verified", "total", "status")
+    Rows are three-level: Feeder > Date > Entry (one per kind). Sensor
+    rows also show the sensor type (L3/TV540/TVGO) and a Base column
+    that flags whether a matching base-station manifest exists for the
+    same (feeder, date), so you can spot a pilot who's forgotten to
+    upload their base station data at a glance.
+    """
 
-    def __init__(self, parent: App, on_start):
-        super().__init__(parent)
-        self.title("Download from cloud")
-        self.geometry("980x680")
-        self.on_start = on_start
-        self.parent_app = parent
-
-        self.transient(parent)
-        self.lift()
-        self.attributes("-topmost", True)
-        self.after(300, lambda: self.attributes("-topmost", False))
-        self.focus_force()
-        self.grab_set()
-
-        self.client_var = tk.StringVar(value=VALID_CLIENTS[0])
-        self.program_var = tk.StringVar(value=VALID_PROGRAMS[0])
-        self.feeder_var = tk.StringVar()
-        self.dest_var = tk.StringVar()
-
-        # date -> {"kind","date","total","verified","status","manifest"}
-        self._rows: list[dict] = []
-
-        pad = {"padx": 8, "pady": 4}
-        row = 0
-        ttk.Label(self, text="Client").grid(row=row, column=0, sticky="w", **pad)
-        ttk.Combobox(self, values=VALID_CLIENTS, textvariable=self.client_var,
-                     state="readonly").grid(row=row, column=1, sticky="ew", **pad)
-        row += 1
-        ttk.Label(self, text="Program").grid(row=row, column=0, sticky="w", **pad)
-        ttk.Combobox(self, values=VALID_PROGRAMS, textvariable=self.program_var,
-                     state="readonly").grid(row=row, column=1, sticky="ew", **pad)
-        row += 1
-        ttk.Label(self, text="Feeder").grid(row=row, column=0, sticky="w", **pad)
-        # Downloads are restricted to known feeders -- readonly Combobox so a
-        # typo can't produce a fake path (and we know VALID_FEEDERS lists the
-        # only paths worth reconstructing under /lidardata/xcel/2026/).
-        AutocompleteCombobox(self, VALID_FEEDERS, textvariable=self.feeder_var,
-                             state="normal", uppercase=True
-                             ).grid(row=row, column=1, sticky="ew", **pad)
-        ttk.Button(self, text="Load dates", command=self._load).grid(
-            row=row, column=2, **pad)
-        row += 1
-
-        warn = tk.Message(
-            self,
-            text=(
-                "WARNING: 'Verified / Total' comes from the cloud manifest for "
-                "each date. If a pilot has NOT yet started their upload for a "
-                "date, their items are absent from the manifest -- a fully green "
-                "row does NOT guarantee that ALL data for that day has been "
-                "uploaded. When multiple pilots split a day, coordinate with "
-                "them before treating a green row as final."
-            ),
-            width=940, foreground="#8a4b00",
-        )
-        warn.grid(row=row, column=0, columnspan=3, sticky="ew", padx=8, pady=(4, 6))
-        row += 1
-
-        # Legend
-        legend = ttk.Frame(self, padding=(8, 0))
-        legend.grid(row=row, column=0, columnspan=3, sticky="w")
-        for text, color in [("Complete", "#c9f2c9"), ("In progress", "#fff2c9"),
-                            ("Empty / unreadable", "#f2c9c9")]:
-            lab = tk.Label(legend, text=f"  {text}  ", background=color,
-                            relief="solid", borderwidth=1)
-            lab.pack(side="left", padx=4)
-        row += 1
-
-        tree_frame = ttk.Frame(self)
-        tree_frame.grid(row=row, column=0, columnspan=3, sticky="nsew",
-                        padx=8, pady=6)
-        self.tree = ttk.Treeview(tree_frame, columns=self.COLUMNS,
-                                 show="headings", selectmode="extended",
-                                 height=14)
-        widths = (100, 120, 90, 90, 180)
-        for col, w in zip(self.COLUMNS, widths):
-            self.tree.heading(col, text=col.title())
-            self.tree.column(col, width=w, anchor="w")
-        vsb = ttk.Scrollbar(tree_frame, orient="vertical",
-                            command=self.tree.yview)
-        self.tree.configure(yscrollcommand=vsb.set)
-        self.tree.pack(side="left", fill="both", expand=True)
-        vsb.pack(side="right", fill="y")
-        self.tree.tag_configure("complete", background="#c9f2c9")
-        self.tree.tag_configure("partial", background="#fff2c9")
-        self.tree.tag_configure("empty", background="#f2c9c9")
-        self.rowconfigure(row, weight=1)
-        self.columnconfigure(1, weight=1)
-        row += 1
-
-        dest = ttk.Frame(self, padding=(8, 4))
-        dest.grid(row=row, column=0, columnspan=3, sticky="ew")
-        ttk.Label(dest, text="Destination folder").pack(side="left")
-        ttk.Entry(dest, textvariable=self.dest_var, width=60).pack(
-            side="left", padx=6, fill="x", expand=True)
-        ttk.Button(dest, text="Browse", command=self._pick_dest).pack(side="left")
-        row += 1
-
-        btns = ttk.Frame(self, padding=(8, 4))
-        btns.grid(row=row, column=0, columnspan=3, sticky="ew")
-        ttk.Button(btns, text="Download selected",
-                   command=self._download).pack(side="left")
-        ttk.Button(btns, text="Cancel", command=self.destroy).pack(side="right")
-
-        self.status_var = tk.StringVar(value="")
-        ttk.Label(self, textvariable=self.status_var).grid(
-            row=row + 1, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 6))
-
-    def _pick_dest(self):
-        d = filedialog.askdirectory(title="Select destination folder")
-        if d:
-            self.dest_var.set(d)
-
-    def _load(self):
-        feeder = self.feeder_var.get().strip().upper()
-        if feeder not in VALID_FEEDERS:
-            if not messagebox.askyesno(
-                "Unknown feeder",
-                f"'{feeder}' is not in the known feeder list. Load anyway?",
-            ):
-                return
-        for iid in self.tree.get_children():
-            self.tree.delete(iid)
-        self._rows.clear()
-        self.status_var.set("Scanning cloud for dates...")
-        client = self.client_var.get()
-        program = self.program_var.get()
-        threading.Thread(target=self._load_worker,
-                          args=(client, program, feeder), daemon=True).start()
-
-    def _load_worker(self, client: str, program: str, feeder: str):
-        try:
-            dates_by_kind = discover_dates_for_feeder(client, program, feeder)
-        except Exception as e:
-            self.after(0, lambda: self.status_var.set(f"Discovery failed: {e}"))
-            return
-        rows: list[dict] = []
-        for kind, dates in dates_by_kind.items():
-            for date in dates:
-                path = manifest_blob_path_for(kind, client, program, feeder, date)
-                try:
-                    m = load_cloud_manifest_at(path)
-                except Exception as e:
-                    m = None
-                    self.after(0, lambda e=e, k=kind, d=date:
-                               self._log_status(f"warn: manifest read failed for {k}/{d}: {e}"))
-                if m is None:
-                    rows.append({
-                        "kind": kind, "date": date, "verified": 0,
-                        "total": 0, "status": "no manifest",
-                        "tag": "empty", "manifest": None,
-                    })
-                    continue
-                items = m.get("items", {}) or {}
-                verified = sum(1 for it in items.values() if it.get("status") == STATUS_VERIFIED)
-                total = len(items)
-                if total == 0:
-                    tag = "empty"
-                    status = "empty"
-                elif verified == total:
-                    tag = "complete"
-                    status = "complete"
-                else:
-                    tag = "partial"
-                    status = f"in progress ({verified}/{total} verified)"
-                rows.append({
-                    "kind": kind, "date": date, "verified": verified,
-                    "total": total, "status": status, "tag": tag,
-                    "manifest": m,
-                })
-
-        def apply():
-            self._rows = rows
-            for i, r in enumerate(rows):
-                iid = f"{r['kind']}::{r['date']}"
-                self.tree.insert("", "end", iid=iid, tags=(r["tag"],),
-                                 values=(r["kind"], r["date"],
-                                         r["verified"], r["total"], r["status"]))
-            self.status_var.set(f"Found {len(rows)} date(s) across SENSOR_DATA + BASE_STATION.")
-        self.after(0, apply)
-
-    def _log_status(self, msg: str):
-        self.status_var.set(msg)
-
-    def _download(self):
-        dest = self.dest_var.get().strip()
-        if not dest:
-            messagebox.showerror("No destination", "Pick a destination folder first.")
-            return
-        dest_path = Path(dest)
-        if not dest_path.exists():
-            try:
-                dest_path.mkdir(parents=True, exist_ok=True)
-            except Exception as e:
-                messagebox.showerror("Bad destination", f"Cannot create: {e}")
-                return
-        sel = self.tree.selection()
-        if not sel:
-            messagebox.showerror("Pick rows", "Select one or more dates to download.")
-            return
-        chosen: list[dict] = []
-        for iid in sel:
-            row = next((r for r in self._rows
-                        if f"{r['kind']}::{r['date']}" == iid), None)
-            if row and row.get("manifest") and row["total"] > 0:
-                chosen.append(row["manifest"])
-        if not chosen:
-            messagebox.showerror("Nothing usable",
-                                 "Selected rows have no manifest / no items to download.")
-            return
-        verified_total = sum(
-            sum(1 for it in m.get("items", {}).values() if it.get("status") == STATUS_VERIFIED)
-            for m in chosen
-        )
-        if not messagebox.askyesno(
-            "Confirm download",
-            f"Download {verified_total} verified item(s) across {len(chosen)} date(s) "
-            f"into:\n{dest_path}\n\nOnly items marked verified in the manifest are "
-            f"downloaded. Zips are md5-verified and then extracted so the mission "
-            f"folders appear exactly as they were uploaded.",
-        ):
-            return
-        self.destroy()
-        self.on_start(chosen, dest_path)
-
-
-# --- upload tracker dialog ---------------------------------------------------
-
-
-class UploadTrackerDialog(tk.Toplevel):
-    """Master view of every upload the tool has recorded (via the
-    _uploads_index.json blob). Grouped by feeder, sorted by most-recent
-    activity, with a take-over resume flow so a second pilot who never had
-    the local manifest can point at where the files are on their system
-    and continue an upload."""
-
-    ENTRY_COLS = ("kind", "date", "pilot", "systems", "progress", "updated")
+    ENTRY_COLS = ("kind", "sensor", "pilot", "systems", "progress",
+                  "base", "updated")
 
     def __init__(self, parent: App):
         super().__init__(parent)
-        self.title("Upload tracker")
-        self.geometry("1080x680")
+        self.title("Uploads")
+        self.geometry("1180x760")
         self.parent_app = parent
 
         self.transient(parent)
@@ -3429,7 +3199,10 @@ class UploadTrackerDialog(tk.Toplevel):
         self.program_var = tk.StringVar(value=VALID_PROGRAMS[0])
         self.search_var = tk.StringVar()
         self.search_var.trace_add("write", lambda *_: self._refill())
+        self.dest_var = tk.StringVar()
         self._entries: list[dict] = []
+        # (feeder, date) -> dict with base_entry (or None)
+        self._base_index: dict[tuple[str, str], dict | None] = {}
 
         top = ttk.Frame(self, padding=8)
         top.pack(fill="x")
@@ -3445,28 +3218,75 @@ class UploadTrackerDialog(tk.Toplevel):
         ttk.Label(top, text="Search").pack(side="left", padx=(20, 4))
         ttk.Entry(top, textvariable=self.search_var, width=30).pack(side="left")
 
+        # Persistent warning + help block above the table.
+        info = tk.Message(
+            self,
+            width=1140, padx=8, pady=4,
+            text=(
+                "WARNING: 'Progress' comes from cloud manifests. If a pilot "
+                "hasn't started their upload for a date, their items are "
+                "absent from the manifest -- a complete row does NOT guarantee "
+                "ALL data for that day is present, especially when multiple "
+                "pilots share a day. Coordinate before treating a row as final.\n\n"
+                "HELP: pick a leaf row (not a feeder/date header), then:\n"
+                "  * DOWNLOAD SELECTED pulls every verified item in that "
+                "manifest to the Destination folder below. Zips are md5-"
+                "verified and unzipped so the mission folder appears exactly "
+                "as it was uploaded.\n"
+                "  * RESUME SELECTED opens the take-over dialog. Give the "
+                "current pilot's name and point at where the local files are "
+                "on THIS machine; any unfinished items whose folder / file "
+                "matches by name will be adopted and uploaded from here."
+            ),
+            foreground="#8a4b00",
+        )
+        info.pack(fill="x", padx=8, pady=(2, 4))
+
+        # Row-color legend
+        legend = ttk.Frame(self, padding=(8, 0))
+        legend.pack(fill="x")
+        for text, color in [("Complete", "#c9f2c9"),
+                             ("In progress", "#fff2c9"),
+                             ("Empty / no items", "#f2c9c9"),
+                             ("Missing base station", "#fddede")]:
+            tk.Label(legend, text=f"  {text}  ", background=color,
+                     relief="solid", borderwidth=1).pack(side="left", padx=4)
+
         tree_frame = ttk.Frame(self)
         tree_frame.pack(fill="both", expand=True, padx=8, pady=6)
         self.tree = ttk.Treeview(tree_frame, columns=self.ENTRY_COLS,
-                                 show="tree headings", height=20)
-        self.tree.heading("#0", text="Feeder")
-        self.tree.column("#0", width=140, anchor="w")
-        widths = (80, 100, 140, 200, 110, 170)
+                                  show="tree headings", height=20)
+        self.tree.heading("#0", text="Feeder / Date")
+        self.tree.column("#0", width=180, anchor="w")
+        widths = (70, 70, 140, 180, 90, 130, 160)
         for col, w in zip(self.ENTRY_COLS, widths):
             self.tree.heading(col, text=col.title())
             self.tree.column(col, width=w, anchor="w")
-        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical",
+                             command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
         self.tree.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
         self.tree.tag_configure("complete", background="#c9f2c9")
         self.tree.tag_configure("partial", background="#fff2c9")
         self.tree.tag_configure("empty", background="#f2c9c9")
-        self.tree.bind("<Double-1>", lambda _e: self._resume_selected())
+        self.tree.tag_configure("missing_base", background="#fddede")
+        self.tree.bind("<Double-1>", lambda _e: self._download_or_resume())
+
+        # Destination folder for downloads
+        dest = ttk.Frame(self, padding=(8, 4))
+        dest.pack(fill="x")
+        ttk.Label(dest, text="Destination folder (for Download)").pack(side="left")
+        ttk.Entry(dest, textvariable=self.dest_var, width=60).pack(
+            side="left", padx=6, fill="x", expand=True)
+        ttk.Button(dest, text="Browse", command=self._pick_dest).pack(side="left")
 
         btns = ttk.Frame(self, padding=8)
         btns.pack(fill="x")
-        ttk.Button(btns, text="Resume selected", command=self._resume_selected).pack(side="left")
+        ttk.Button(btns, text="Download selected",
+                    command=self._download).pack(side="left")
+        ttk.Button(btns, text="Resume selected",
+                    command=self._resume).pack(side="left", padx=6)
         ttk.Button(btns, text="Close", command=self.destroy).pack(side="right")
 
         self.status_var = tk.StringVar(value="")
@@ -3474,21 +3294,21 @@ class UploadTrackerDialog(tk.Toplevel):
 
         self._load()
 
-    # ---- loading ----
+    # ---- data ----
 
     def _load(self):
         self.status_var.set("Loading master index...")
         self.tree.delete(*self.tree.get_children())
         client = self.client_var.get()
         program = self.program_var.get()
+
         def worker():
             try:
                 idx = load_master_index(client, program)
             except Exception as e:
                 self.after(0, lambda: self.status_var.set(f"Failed to load index: {e}"))
                 return
-            entries = idx.get("entries") or []
-            self.after(0, lambda: self._apply(entries))
+            self.after(0, lambda: self._apply(idx.get("entries") or []))
         threading.Thread(target=worker, daemon=True).start()
 
     def _rebuild(self):
@@ -3501,9 +3321,11 @@ class UploadTrackerDialog(tk.Toplevel):
         client = self.client_var.get()
         program = self.program_var.get()
         self.status_var.set("Rebuilding: scanning feeders...")
+
         def prog(i, total, feeder):
             self.after(0, lambda: self.status_var.set(
                 f"Rebuilding {i}/{total}: {feeder}"))
+
         def worker():
             try:
                 idx = rebuild_master_index(client, program, progress_cb=prog)
@@ -3511,78 +3333,199 @@ class UploadTrackerDialog(tk.Toplevel):
                 self.after(0, lambda: self.status_var.set(f"Rebuild failed: {e}"))
                 return
             entries = idx.get("entries") or []
-            self.after(0, lambda: (self._apply(entries),
-                                    self.status_var.set(
-                                        f"Rebuilt. {len(entries)} manifest(s) indexed.")))
+            self.after(0, lambda: (
+                self._apply(entries),
+                self.status_var.set(f"Rebuilt. {len(entries)} manifest(s) indexed."),
+            ))
         threading.Thread(target=worker, daemon=True).start()
 
     def _apply(self, entries: list[dict]):
         self._entries = entries
+        # Precompute base-station map so sensor rows can flag missing bases.
+        self._base_index = {}
+        for e in entries:
+            if e.get("kind") == KIND_BASE:
+                self._base_index[(e["feeder"], e["collection_date"])] = e
         self._refill()
+
+    def _row_matches(self, e: dict, q: str) -> bool:
+        if not q:
+            return True
+        blob = " ".join(str(e.get(k, "")) for k in
+                        ("feeder", "kind", "sensor", "collection_date",
+                         "pilot_name", "system_name")).lower()
+        blob += " " + " ".join(e.get("pilots") or []).lower()
+        blob += " " + " ".join(e.get("systems") or []).lower()
+        return q in blob
 
     def _refill(self):
         self.tree.delete(*self.tree.get_children())
         q = self.search_var.get().strip().lower()
-        # group by feeder
-        by_feeder: dict[str, list[dict]] = {}
+
+        # Group: feeder -> date -> [entries]
+        by_feeder: dict[str, dict[str, list[dict]]] = {}
         for e in self._entries:
-            blob = " ".join(str(e.get(k, "")) for k in
-                            ("feeder", "kind", "collection_date", "pilot_name",
-                             "system_name")).lower()
-            blob += " " + " ".join(e.get("pilots") or []).lower()
-            blob += " " + " ".join(e.get("systems") or []).lower()
-            if q and q not in blob:
+            if not self._row_matches(e, q):
                 continue
-            by_feeder.setdefault(e["feeder"], []).append(e)
-        # sort feeders by max updated_utc desc
-        def _max_upd(entries):
-            return max((e.get("updated_utc") or "" for e in entries), default="")
-        feeders = sorted(by_feeder.items(), key=lambda kv: _max_upd(kv[1]), reverse=True)
+            by_feeder.setdefault(e["feeder"], {}) \
+                     .setdefault(e["collection_date"], []).append(e)
+
+        def _max_upd(nested_dates):
+            return max(
+                (e.get("updated_utc") or ""
+                 for date_entries in nested_dates.values()
+                 for e in date_entries),
+                default="")
+
+        # Sort feeders by most-recent activity desc
+        feeders = sorted(by_feeder.items(),
+                          key=lambda kv: _max_upd(kv[1]), reverse=True)
         shown = 0
-        for feeder, entries in feeders:
-            entries.sort(key=lambda e: e.get("updated_utc") or "", reverse=True)
-            parent = self.tree.insert("", "end", text=f"{feeder}  ({len(entries)})",
-                                       open=True)
-            for e in entries:
-                total = int(e.get("total") or 0)
-                verified = int(e.get("verified") or 0)
-                if total == 0:
-                    tag = "empty"
-                    progress = "empty"
-                elif verified == total:
-                    tag = "complete"
-                    progress = f"{verified}/{total}"
-                else:
-                    tag = "partial"
-                    progress = f"{verified}/{total}"
-                systems = ", ".join(e.get("systems") or [])
-                pilots_join = ", ".join(e.get("pilots") or [])
-                pilot = e.get("pilot_name") or ""
-                if pilots_join and pilots_join != pilot:
-                    pilot = f"{pilot} (+ {pilots_join})"
-                iid = e["manifest_blob_path"]
-                self.tree.insert(parent, "end", iid=iid, tags=(tag,), values=(
-                    e.get("kind"),
-                    e.get("collection_date"),
-                    pilot,
-                    systems,
-                    progress,
-                    (e.get("updated_utc") or "")[:19].replace("T", " "),
+        for feeder, date_map in feeders:
+            feeder_node = self.tree.insert("", "end",
+                                            text=f"{feeder}  ({len(date_map)} date(s))",
+                                            open=True)
+            # Sort dates within a feeder by date desc
+            for date in sorted(date_map.keys(), reverse=True):
+                entries = date_map[date]
+                # Sort entries within date: sensor first, then base
+                entries.sort(key=lambda e: (
+                    0 if e.get("kind") == KIND_SENSOR else 1,
+                    e.get("updated_utc") or ""
                 ))
-                shown += 1
-        self.status_var.set(f"{shown} manifest(s) across {len(feeders)} feeder(s).")
+                date_node = self.tree.insert(feeder_node, "end",
+                                              text=f"{date}  ({len(entries)} entry)",
+                                              open=True)
+                for e in entries:
+                    total = int(e.get("total") or 0)
+                    verified = int(e.get("verified") or 0)
+                    if total == 0:
+                        row_tag = "empty"
+                        progress = "empty"
+                    elif verified == total:
+                        row_tag = "complete"
+                        progress = f"{verified}/{total}"
+                    else:
+                        row_tag = "partial"
+                        progress = f"{verified}/{total}"
 
-    # ---- resume / take-over ----
+                    # Base-station flag column (only meaningful for sensor rows)
+                    if e.get("kind") == KIND_SENSOR:
+                        base = self._base_index.get((feeder, date))
+                        if not base:
+                            base_text = "MISSING base"
+                            # Override row color to hot-pink if the base is
+                            # missing, so pilots see it before anything else.
+                            row_tag = "missing_base"
+                        else:
+                            bt = int(base.get("total") or 0)
+                            bv = int(base.get("verified") or 0)
+                            if bt > 0 and bv == bt:
+                                base_text = f"yes ({bv}/{bt})"
+                            else:
+                                base_text = f"partial ({bv}/{bt})"
+                    else:
+                        base_text = "-"
 
-    def _resume_selected(self):
+                    systems = ", ".join(e.get("systems") or [])
+                    pilots_join = ", ".join(e.get("pilots") or [])
+                    pilot = e.get("pilot_name") or ""
+                    if pilots_join and pilots_join != pilot:
+                        pilot = f"{pilot} (+ {pilots_join})"
+
+                    iid = e["manifest_blob_path"]
+                    self.tree.insert(date_node, "end", iid=iid,
+                                      tags=(row_tag,), values=(
+                        e.get("kind") or "",
+                        e.get("sensor") or ("" if e.get("kind") == KIND_BASE else "?"),
+                        pilot,
+                        systems,
+                        progress,
+                        base_text,
+                        (e.get("updated_utc") or "")[:19].replace("T", " "),
+                    ))
+                    shown += 1
+        self.status_var.set(
+            f"{shown} manifest(s) across {len(feeders)} feeder(s)."
+        )
+
+    def _pick_dest(self):
+        d = filedialog.askdirectory(title="Select destination folder")
+        if d:
+            self.dest_var.set(d)
+
+    # ---- actions ----
+
+    def _selected_entry(self) -> dict | None:
         sel = self.tree.selection()
         if not sel:
-            messagebox.showerror("Pick a row", "Select a manifest row (not a feeder header).")
-            return
+            messagebox.showerror("Pick a row",
+                                 "Select a leaf row (not a feeder or date header).")
+            return None
         iid = sel[0]
-        entry = next((e for e in self._entries if e["manifest_blob_path"] == iid), None)
+        entry = next((e for e in self._entries
+                      if e["manifest_blob_path"] == iid), None)
         if not entry:
-            messagebox.showerror("Pick a row", "That's a feeder header; pick one of its rows.")
+            messagebox.showerror("Pick a row",
+                                 "That's a group header; pick one of its rows.")
+            return None
+        return entry
+
+    def _download_or_resume(self):
+        # Double-click default = Download if the row is complete, else Resume.
+        entry = self._selected_entry()
+        if not entry:
+            return
+        if (entry.get("total") or 0) > 0 and \
+                entry.get("verified") == entry.get("total"):
+            self._download()
+        else:
+            self._resume()
+
+    def _download(self):
+        entry = self._selected_entry()
+        if not entry:
+            return
+        dest = self.dest_var.get().strip()
+        if not dest:
+            messagebox.showerror("No destination",
+                                 "Pick a destination folder first.")
+            return
+        dest_path = Path(dest)
+        try:
+            dest_path.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            messagebox.showerror("Bad destination", f"Cannot create: {e}")
+            return
+        try:
+            m = load_cloud_manifest_at(entry["manifest_blob_path"])
+        except Exception as e:
+            messagebox.showerror("Load failed", str(e))
+            return
+        if not m:
+            messagebox.showerror("Not found",
+                                 "That manifest no longer exists on the cloud.")
+            return
+        verified = sum(1 for it in m.get("items", {}).values()
+                       if it.get("status") == STATUS_VERIFIED)
+        if verified == 0:
+            messagebox.showerror("Nothing to download",
+                                 "Manifest has no verified items yet.")
+            return
+        if not messagebox.askyesno(
+            "Confirm download",
+            f"Download {verified} verified item(s) for "
+            f"{m.get('feeder')} / {m.get('kind')} / {m.get('collection_date')} "
+            f"into:\n{dest_path}\n\nOnly verified items are pulled. Zips are "
+            f"md5-verified and unzipped in place.",
+        ):
+            return
+        self.destroy()
+        self.parent_app._start_download([m], dest_path)
+
+    def _resume(self):
+        entry = self._selected_entry()
+        if not entry:
             return
         TakeoverDialog(self, entry, on_ready=self._start_after_takeover)
 
