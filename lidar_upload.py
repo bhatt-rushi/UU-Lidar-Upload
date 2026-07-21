@@ -603,14 +603,20 @@ def parse_rinex_obs_date(path: Path) -> str | None:
     return None
 
 
-def scan_base_station(folder: Path) -> tuple[list[Path], str | None, list[str]]:
-    """Accept .dat (CHC RTK) and RINEX-2 observation files (.YYo). Both
-    require the pilot to trust the typed feeder since neither format
-    encodes it. Returns (files, single-collection-date, warnings)."""
+def scan_base_station(source: Path) -> tuple[list[Path], str | None, list[str]]:
+    """Accept .dat (CHC RTK) and RINEX 3 observation files (.YYo / .rnx).
+    Both require the pilot to trust the typed feeder since neither format
+    encodes it.
+
+    ``source`` may be either a directory of files (iterated) OR a single
+    file (treated as a one-element listing) so a pilot with just one
+    .dat / .26o can point at it directly. Returns (files, single-
+    collection-date, warnings)."""
     files: list[Path] = []
     warnings: list[str] = []
     dates: set[str] = set()
-    for entry in folder.iterdir():
+    entries = [source] if source.is_file() else list(source.iterdir())
+    for entry in entries:
         if entry.is_dir():
             warnings.append(f"skipping subfolder: {entry.name}")
             continue
@@ -2539,12 +2545,18 @@ class NewUploadWizard(tk.Toplevel):
 
         ttk.Separator(self, orient="horizontal").grid(row=row, column=0, columnspan=3, sticky="ew", pady=6)
         row += 1
-        ttk.Checkbutton(self, text="Also upload BASE_STATION folder", variable=self.include_base_var).grid(
+        ttk.Checkbutton(self, text="Also upload BASE_STATION (folder or single file)",
+                        variable=self.include_base_var).grid(
             row=row, column=0, columnspan=2, sticky="w", **pad)
         row += 1
-        ttk.Label(self, text="Base station folder").grid(row=row, column=0, sticky="w", **pad)
+        ttk.Label(self, text="Base station folder / file").grid(row=row, column=0, sticky="w", **pad)
         ttk.Entry(self, textvariable=self.base_source_var).grid(row=row, column=1, sticky="ew", **pad)
-        ttk.Button(self, text="Browse", command=self._pick_base).grid(row=row, column=2, **pad)
+        base_btns = ttk.Frame(self)
+        base_btns.grid(row=row, column=2, sticky="w", **pad)
+        ttk.Button(base_btns, text="Folder...",
+                    command=self._pick_base_folder).pack(side="left")
+        ttk.Button(base_btns, text="File...",
+                    command=self._pick_base_file).pack(side="left", padx=(4, 0))
         row += 1
 
         self.columnconfigure(1, weight=1)
@@ -2567,10 +2579,21 @@ class NewUploadWizard(tk.Toplevel):
         if d:
             self.source_var.set(d)
 
-    def _pick_base(self):
+    def _pick_base_folder(self):
         d = filedialog.askdirectory(title="Select base station folder")
         if d:
             self.base_source_var.set(d)
+
+    def _pick_base_file(self):
+        f = filedialog.askopenfilename(
+            title="Select a single base station file",
+            filetypes=[
+                ("Base station files", "*.dat *.rnx *.[0-9][0-9]o *.[0-9][0-9]O"),
+                ("All files", "*.*"),
+            ],
+        )
+        if f:
+            self.base_source_var.set(f)
 
     def _report(self, s: str):
         self.report.insert("end", s + "\n")
@@ -2648,20 +2671,34 @@ class NewUploadWizard(tk.Toplevel):
         base_info = None
         if self.include_base_var.get():
             bp = self.base_source_var.get().strip()
-            if not bp or not Path(bp).is_dir():
-                messagebox.showerror("Bad base folder", "Pick a valid base station folder.")
+            src_path = Path(bp) if bp else None
+            if not src_path or not src_path.exists():
+                messagebox.showerror(
+                    "Bad base source",
+                    "Pick a valid base station folder OR a single .dat / RINEX file."
+                )
                 return
-            dats, bdate, warnings = scan_base_station(Path(bp))
+            dats, bdate, warnings = scan_base_station(src_path)
             for w in warnings:
                 self._report(f"[base] {w}")
             if not dats:
-                messagebox.showerror("Empty base folder", "No .dat / latest_index files found.")
+                messagebox.showerror(
+                    "No usable files",
+                    "No .dat / RINEX .YYo / .rnx files found at that path."
+                )
                 return
             if not bdate:
-                messagebox.showerror("No date", "Could not determine collection date from .dat filenames.")
+                messagebox.showerror(
+                    "No date",
+                    "Could not determine collection date from the base station file(s)."
+                )
                 return
-            self._report(f"Base station: {len(dats)} files, date {bdate}")
-            base_info = {"folder": bp, "date": bdate, "files": [str(p) for p in dats]}
+            self._report(f"Base station: {len(dats)} file(s), date {bdate}")
+            # 'folder' key kept for backward compat with the manifest schema;
+            # for a single-file source this is the parent directory.
+            folder_str = str(src_path if src_path.is_dir() else src_path.parent)
+            base_info = {"folder": folder_str, "date": bdate,
+                         "files": [str(p) for p in dats]}
 
         if not sensor_by_date and not base_info:
             messagebox.showerror("Nothing to do", "Enable at least one of SENSOR_DATA or BASE_STATION.")
@@ -3810,13 +3847,13 @@ class QueueDialog(tk.Toplevel):
         info = tk.Message(
             self, width=1080, padx=8, pady=4,
             text=(
-                "The queue processes manifests in the order shown. Use Up "
+                "The queue uploads manifests in the order shown. Use Up "
                 "/ Down to reorder, Remove to drop an item, Refresh to "
                 "re-check whether the source data is reachable right now. "
-                "On Start Processing, each item's data availability is "
+                "On Start Uploads, each item's data availability is "
                 "re-checked one more time; items whose sources aren't "
                 "present (drive disconnected, files moved) are skipped "
-                "and processing continues with the next item."
+                "and the queue continues with the next item."
             ),
             foreground="#555555",
         )
@@ -3847,7 +3884,7 @@ class QueueDialog(tk.Toplevel):
         ttk.Button(btns, text="Move down", command=lambda: self._move(1)).pack(side="left", padx=6)
         ttk.Button(btns, text="Remove selected", command=self._remove).pack(side="left", padx=6)
         ttk.Button(btns, text="Refresh", command=self._reload).pack(side="left", padx=6)
-        ttk.Button(btns, text="Start processing", command=self._start).pack(side="left", padx=18)
+        ttk.Button(btns, text="Start uploads", command=self._start).pack(side="left", padx=18)
         ttk.Button(btns, text="Close", command=self.destroy).pack(side="right")
 
         self.status_var = tk.StringVar(value="")
@@ -3989,8 +4026,8 @@ class QueueDialog(tk.Toplevel):
             )
             return
         if not messagebox.askyesno(
-            "Confirm processing",
-            f"Process {len(ready)} queue item(s) now?\n\nThe upload session "
+            "Confirm uploads",
+            f"Upload {len(ready)} queue item(s) now?\n\nThe upload session "
             f"will run them in order; you can Stop at any time."
         ):
             return
