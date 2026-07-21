@@ -2165,7 +2165,10 @@ class App(tk.Tk):
         self._clear()
         frame = ttk.Frame(self, padding=10)
         frame.pack(fill="both", expand=True)
-        ttk.Label(frame, text="Upload in progress", font=("Segoe UI", 14, "bold")).pack(anchor="w")
+        title = ("Download in progress"
+                 if getattr(self, "_mode", "upload") == "download"
+                 else "Upload in progress")
+        ttk.Label(frame, text=title, font=("Segoe UI", 14, "bold")).pack(anchor="w")
         self.progress_var = tk.StringVar(value="0 / 0")
         ttk.Label(frame, textvariable=self.progress_var).pack(anchor="w")
         self.progress_bar = ttk.Progressbar(frame, maximum=1, value=0)
@@ -3481,39 +3484,48 @@ class UploadsBrowserDialog(tk.Toplevel):
     # ---- actions ----
 
     def _refresh_action_states(self):
-        """Only enable Resume when the selected leaf has unfinished work."""
-        sel = self.tree.selection()
-        entry = None
-        if sel:
-            entry = next((e for e in self._entries
-                          if e["manifest_blob_path"] == sel[0]), None)
+        """Only enable Resume when EXACTLY ONE leaf with unfinished work is
+        selected (take-over is per-manifest). Download tolerates any number."""
+        entries = self._selected_entries(silent=True)
         can_resume = False
-        if entry:
-            total = int(entry.get("total") or 0)
-            verified = int(entry.get("verified") or 0)
+        if len(entries) == 1:
+            e = entries[0]
+            total = int(e.get("total") or 0)
+            verified = int(e.get("verified") or 0)
             # Resume makes sense whenever there's something not yet verified.
-            # (total==0 also qualifies -- e.g. cloud manifest exists but no
-            # items yet; a pilot may want to take it over and repopulate.)
+            # total==0 also qualifies -- a placeholder cloud manifest with
+            # no items can be taken over and repopulated.
             can_resume = (total == 0) or (verified < total)
         if can_resume:
             self.resume_btn.state(["!disabled"])
         else:
             self.resume_btn.state(["disabled"])
 
-    def _selected_entry(self) -> dict | None:
-        sel = self.tree.selection()
-        if not sel:
-            messagebox.showerror("Pick a row",
-                                 "Select a leaf row (not a feeder or date header).")
-            return None
-        iid = sel[0]
-        entry = next((e for e in self._entries
+    def _selected_entries(self, silent: bool = False) -> list[dict]:
+        """Return every leaf-entry currently selected (group headers are
+        silently skipped since they aren't in _entries)."""
+        entries: list[dict] = []
+        for iid in self.tree.selection():
+            e = next((e for e in self._entries
                       if e["manifest_blob_path"] == iid), None)
-        if not entry:
+            if e:
+                entries.append(e)
+        if not entries and not silent:
             messagebox.showerror("Pick a row",
-                                 "That's a group header; pick one of its rows.")
+                                 "Select one or more leaf rows (not a feeder or date header).")
+        return entries
+
+    def _selected_entry(self) -> dict | None:
+        entries = self._selected_entries()
+        if not entries:
             return None
-        return entry
+        if len(entries) > 1:
+            messagebox.showerror(
+                "One at a time",
+                "Resume takes over one manifest at a time. Select just one row."
+            )
+            return None
+        return entries[0]
 
     def _download_or_resume(self):
         # Double-click default = Download if the row is complete, else Resume.
@@ -3527,8 +3539,8 @@ class UploadsBrowserDialog(tk.Toplevel):
             self._resume()
 
     def _download(self):
-        entry = self._selected_entry()
-        if not entry:
+        entries = self._selected_entries()
+        if not entries:
             return
         dest = self.dest_var.get().strip()
         if not dest:
@@ -3541,31 +3553,52 @@ class UploadsBrowserDialog(tk.Toplevel):
         except Exception as e:
             messagebox.showerror("Bad destination", f"Cannot create: {e}")
             return
-        try:
-            m = load_cloud_manifest_at(entry["manifest_blob_path"])
-        except Exception as e:
-            messagebox.showerror("Load failed", str(e))
+
+        loaded: list[dict] = []
+        load_errors: list[str] = []
+        for entry in entries:
+            try:
+                m = load_cloud_manifest_at(entry["manifest_blob_path"])
+            except Exception as e:
+                load_errors.append(f"{entry['manifest_blob_path']}: {e}")
+                continue
+            if not m:
+                load_errors.append(f"{entry['manifest_blob_path']}: not found on cloud")
+                continue
+            loaded.append(m)
+        if load_errors:
+            messagebox.showwarning(
+                "Some manifests could not be loaded",
+                "The following selected manifests were skipped:\n\n" +
+                "\n".join(load_errors),
+            )
+        if not loaded:
             return
-        if not m:
-            messagebox.showerror("Not found",
-                                 "That manifest no longer exists on the cloud.")
-            return
-        verified = sum(1 for it in m.get("items", {}).values()
-                       if it.get("status") == STATUS_VERIFIED)
-        if verified == 0:
+
+        verified_total = sum(
+            1 for m in loaded for it in m.get("items", {}).values()
+            if it.get("status") == STATUS_VERIFIED
+        )
+        if verified_total == 0:
             messagebox.showerror("Nothing to download",
-                                 "Manifest has no verified items yet.")
+                                 "None of the selected manifests have verified items yet.")
             return
+        preview_rows = "\n".join(
+            f"  - {m.get('feeder')} / {m.get('kind')} / {m.get('collection_date')}  "
+            f"({sum(1 for it in m.get('items', {}).values() if it.get('status') == STATUS_VERIFIED)}"
+            f"/{len(m.get('items', {}))} verified)"
+            for m in loaded
+        )
         if not messagebox.askyesno(
             "Confirm download",
-            f"Download {verified} verified item(s) for "
-            f"{m.get('feeder')} / {m.get('kind')} / {m.get('collection_date')} "
-            f"into:\n{dest_path}\n\nOnly verified items are pulled. Zips are "
-            f"md5-verified and unzipped in place.",
+            f"Download {verified_total} verified item(s) across "
+            f"{len(loaded)} manifest(s):\n\n{preview_rows}\n\n"
+            f"Destination:\n{dest_path}\n\nOnly verified items are pulled. "
+            f"Zips are md5-verified and unzipped in place.",
         ):
             return
         self.destroy()
-        self.parent_app._start_download([m], dest_path)
+        self.parent_app._start_download(loaded, dest_path)
 
     def _resume(self):
         entry = self._selected_entry()
