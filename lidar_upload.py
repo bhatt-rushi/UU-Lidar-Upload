@@ -2084,17 +2084,17 @@ class App(tk.Tk):
                   foreground="black" if azcopy_path().exists() else "red").pack(pady=2)
 
         ttk.Separator(frame).pack(fill="x", pady=14)
-        ttk.Button(frame, text="New upload", width=30,
+        ttk.Button(frame, text="New upload", width=40,
                    command=self._start_new_wizard).pack(pady=6)
-        ttk.Button(frame, text="Resume from manifest...", width=30,
+        ttk.Button(frame, text="Resume from manifest...", width=40,
                    command=self._start_resume).pack(pady=6)
-        ttk.Button(frame, text="Uploads (browse / download / resume)", width=30,
+        ttk.Button(frame, text="Uploads (browse / download / resume)", width=40,
                    command=self._open_uploads).pack(pady=6)
-        ttk.Button(frame, text="Am I Good To Delete? / Validate cloud", width=30,
+        ttk.Button(frame, text="Am I Good To Delete? / Validate cloud", width=40,
                    command=self._open_deletion_check).pack(pady=6)
-        ttk.Button(frame, text="Advanced options...", width=30,
+        ttk.Button(frame, text="Advanced options...", width=40,
                    command=self._open_advanced).pack(pady=6)
-        ttk.Button(frame, text="Exit", width=30, command=self.destroy).pack(pady=6)
+        ttk.Button(frame, text="Exit", width=40, command=self.destroy).pack(pady=6)
 
     def _open_advanced(self):
         AdvancedDialog(self, self.advanced)
@@ -3216,7 +3216,7 @@ class UploadsBrowserDialog(tk.Toplevel):
         ttk.Button(top, text="Refresh from cloud (rescan all feeders)",
                    command=self._rebuild).pack(side="left", padx=4)
         ttk.Label(top, text="Search").pack(side="left", padx=(20, 4))
-        ttk.Entry(top, textvariable=self.search_var, width=30).pack(side="left")
+        ttk.Entry(top, textvariable=self.search_var, width=40).pack(side="left")
 
         # Persistent warning + help block above the table.
         info = tk.Message(
@@ -3381,7 +3381,11 @@ class UploadsBrowserDialog(tk.Toplevel):
         feeders = sorted(by_feeder.items(),
                           key=lambda kv: _max_upd(kv[1]), reverse=True)
         shown = 0
-        for feeder, date_map in feeders:
+        for i, (feeder, date_map) in enumerate(feeders):
+            if i > 0:
+                # Blank spacer row between feeders so the boundary is obvious.
+                self.tree.insert("", "end", text="",
+                                  values=("",) * len(self.ENTRY_COLS))
             feeder_node = self.tree.insert("", "end",
                                             text=f"{feeder}  ({len(date_map)} date(s))",
                                             open=True)
@@ -3681,9 +3685,9 @@ class DriveRemapDialog(tk.Toplevel):
         self.old_var = tk.StringVar()
         self.new_var = tk.StringVar()
         ttk.Label(rowf, text="Old prefix").grid(row=0, column=0, sticky="w")
-        ttk.Entry(rowf, textvariable=self.old_var, width=30).grid(row=0, column=1, sticky="ew", padx=4)
+        ttk.Entry(rowf, textvariable=self.old_var, width=40).grid(row=0, column=1, sticky="ew", padx=4)
         ttk.Label(rowf, text="New prefix").grid(row=1, column=0, sticky="w")
-        ttk.Entry(rowf, textvariable=self.new_var, width=30).grid(row=1, column=1, sticky="ew", padx=4)
+        ttk.Entry(rowf, textvariable=self.new_var, width=40).grid(row=1, column=1, sticky="ew", padx=4)
         rowf.columnconfigure(1, weight=1)
 
         btns = ttk.Frame(self); btns.pack(fill="x", padx=10, pady=10)
