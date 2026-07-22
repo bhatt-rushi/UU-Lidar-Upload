@@ -1367,25 +1367,36 @@ class UploadSession:
             ticker.join(timeout=2)
 
     def _run_one_pass(self):
-        """One pass through every manifest. SENSOR manifests get the
-        zipper+uploader pipeline; BASE manifests get direct upload.
-        VERIFIED items are skipped inside each pipeline."""
-        sensor_manifests = [(m, p) for m, p in self.manifests if m["kind"] == KIND_SENSOR]
-        base_manifests = [(m, p) for m, p in self.manifests if m["kind"] == KIND_BASE]
-
-        if sensor_manifests and not self._stop.is_set():
-            depth = int(self.advanced.get("zip_queue_depth", 5) or 5)
-            self._zip_queue = queue.Queue(maxsize=depth)  # fresh queue each pass
+        """One pass through every manifest in the order given (which is
+        the queue order the pilot set). Consecutive SENSOR manifests are
+        batched into a single zipper+uploader pipeline so the background
+        zipper can prep items from the next sensor manifest while the
+        uploader is still on the current one. A BASE manifest between
+        sensors is a barrier: the current sensor batch drains, base
+        uploads, then the next sensor batch starts. VERIFIED items are
+        skipped inside each pipeline."""
+        depth = int(self.advanced.get("zip_queue_depth", 5) or 5)
+        i = 0
+        while i < len(self.manifests) and not self._stop.is_set():
+            m, p = self.manifests[i]
+            if m["kind"] == KIND_BASE:
+                self._base_upload(m, p)
+                i += 1
+                continue
+            # Collect a run of consecutive sensor manifests.
+            batch: list[tuple[dict, Path]] = []
+            while (i < len(self.manifests)
+                   and self.manifests[i][0]["kind"] == KIND_SENSOR):
+                batch.append(self.manifests[i])
+                i += 1
+            if not batch or self._stop.is_set():
+                continue
+            self._zip_queue = queue.Queue(maxsize=depth)  # fresh per batch
             zipper = threading.Thread(target=self._zip_loop,
-                                      args=(sensor_manifests,), daemon=True)
+                                       args=(batch,), daemon=True)
             zipper.start()
-            self._sensor_upload_loop(sensor_manifests)
+            self._sensor_upload_loop(batch)
             zipper.join(timeout=5)
-
-        for m, p in base_manifests:
-            if self._stop.is_set():
-                break
-            self._base_upload(m, p)
 
     def _count_failed(self) -> int:
         return sum(1 for m, _ in self.manifests
