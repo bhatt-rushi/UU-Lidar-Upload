@@ -1015,6 +1015,57 @@ class UploadQueue:
         self.save()
 
 
+def suggest_drive_remap(m: dict) -> tuple[str, str] | None:
+    """If every missing pending source in ``m`` shares a single drive
+    letter and swapping that letter to some other currently-mounted
+    letter makes ALL of them reachable, return (old_prefix, new_prefix)
+    -- both in the form 'X:\\'. Otherwise return None.
+
+    Windows-only; on other platforms returns None.
+    """
+    if os.name != "nt":
+        return None
+    missing = []
+    for it in m.get("items", {}).values():
+        if it.get("status") == STATUS_VERIFIED:
+            continue
+        p = it.get("original_path", "")
+        if not p:
+            continue
+        try:
+            if not Path(p).exists():
+                missing.append(Path(p))
+        except Exception:
+            missing.append(Path(p))
+    if not missing:
+        return None
+    # All must share the same original drive letter.
+    orig_drives = {os.path.splitdrive(str(p))[0].upper() for p in missing}
+    if len(orig_drives) != 1:
+        return None
+    orig_drive = next(iter(orig_drives))
+    if not orig_drive or len(orig_drive) < 2:
+        return None
+    for letter in "DEFGHIJKLMNOPQRSTUVWXYZ":
+        new_drive = f"{letter}:"
+        if new_drive == orig_drive:
+            continue
+        if not Path(new_drive + os.sep).exists():
+            continue
+        # Does swapping the drive letter reach every missing source?
+        remapped_ok = 0
+        for src in missing:
+            remapped = new_drive + str(src)[len(orig_drive):]
+            try:
+                if Path(remapped).exists():
+                    remapped_ok += 1
+            except Exception:
+                pass
+        if remapped_ok == len(missing):
+            return (orig_drive + os.sep, new_drive + os.sep)
+    return None
+
+
 def manifest_availability(m: dict) -> dict:
     """Count how many non-verified items in ``m`` still have their source on
     disk. A manifest with pending > 0 and present == 0 is a queue item we
@@ -3751,6 +3802,7 @@ class QueueDialog(tk.Toplevel):
         ttk.Button(btns, text="Move up", command=lambda: self._move(-1)).pack(side="left")
         ttk.Button(btns, text="Move down", command=lambda: self._move(1)).pack(side="left", padx=6)
         ttk.Button(btns, text="Remove selected", command=self._remove).pack(side="left", padx=6)
+        ttk.Button(btns, text="Remap paths...", command=self._remap).pack(side="left", padx=6)
         ttk.Button(btns, text="Refresh", command=self._reload).pack(side="left", padx=6)
         ttk.Button(btns, text="Start uploads", command=self._start).pack(side="left", padx=18)
         ttk.Button(btns, text="Close", command=self.destroy).pack(side="right")
@@ -3853,6 +3905,42 @@ class QueueDialog(tk.Toplevel):
         self.parent_app._refresh_queue_count()
         self._reload()
 
+    def _remap(self):
+        """Manually edit a selected manifest's source paths via an old ->
+        new prefix swap (e.g. E:\\ -> F:\\). Rewrites in place, saves the
+        manifest, and reloads the row so the pilot sees the effect
+        immediately."""
+        p = self._selected_path()
+        if not p:
+            return
+        pp = Path(p)
+        if not pp.exists():
+            messagebox.showerror("Not on disk",
+                                 "That manifest file no longer exists.")
+            return
+        try:
+            m = load_local_manifest(pp)
+        except Exception as e:
+            messagebox.showerror("Load failed", str(e))
+            return
+        # Best-effort suggestion so the pilot doesn't type by hand.
+        suggestion = suggest_drive_remap(m)
+        dlg = _RemapPrefixDialog(self, suggestion)
+        old, new = dlg.result
+        if not old and not new:
+            return
+        if not old or not new:
+            messagebox.showerror("Incomplete",
+                                 "Fill both Old and New prefix, or Cancel.")
+            return
+        _remap_paths(m, old, new)
+        save_local_manifest(m, pp)
+        self._reload()
+        # Keep selection on the same row
+        if p in self.tree.get_children():
+            self.tree.selection_set(p)
+            self.tree.see(p)
+
     def _start(self):
         # Re-check availability at start-time (drive may have popped in/out
         # since Reload). Load each manifest; skip anything missing or with
@@ -3877,11 +3965,30 @@ class QueueDialog(tk.Toplevel):
                 continue
             avail = manifest_availability(m)
             if avail["pending"] > 0 and avail["present"] == 0:
-                skipped.append(
-                    f"{p}: no source data reachable "
-                    f"(0/{avail['pending']} present)"
-                )
-                continue
+                # Before giving up on this manifest, try to auto-detect a
+                # simple drive-letter shift and offer to apply it. Most
+                # "SD card is on F: today, not E:" cases resolve here
+                # with a single confirm.
+                suggestion = suggest_drive_remap(m)
+                if suggestion:
+                    old, new = suggestion
+                    if messagebox.askyesno(
+                        "Auto-detected drive change",
+                        f"{Path(p).name}\n\n"
+                        f"Every unfinished source in this manifest is "
+                        f"missing at {old} but reachable at {new}. Apply "
+                        f"the remap and include it in this upload run?"
+                    ):
+                        _remap_paths(m, old, new)
+                        save_local_manifest(m, pp)
+                        avail = manifest_availability(m)
+                if avail["pending"] > 0 and avail["present"] == 0:
+                    skipped.append(
+                        f"{p}: no source data reachable "
+                        f"(0/{avail['pending']} present). Use "
+                        f"'Remap paths...' if the drive letter changed."
+                    )
+                    continue
             ready.append((m, pp))
         if skipped:
             messagebox.showwarning(
@@ -3904,6 +4011,61 @@ class QueueDialog(tk.Toplevel):
             return
         self.destroy()
         self.parent_app._process_queue(ready)
+
+
+class _RemapPrefixDialog(tk.Toplevel):
+    """Modal two-field prompt for an old -> new path prefix swap. If a
+    suggestion tuple is provided the fields come pre-filled with it. Sets
+    ``self.result`` to (old, new) on OK or (None, None) on Cancel."""
+
+    def __init__(self, parent, suggestion: tuple[str, str] | None):
+        super().__init__(parent)
+        self.title("Remap paths")
+        self.result: tuple[str | None, str | None] = (None, None)
+        self.transient(parent)
+        self.lift()
+        self.attributes("-topmost", True)
+        self.after(200, lambda: self.attributes("-topmost", False))
+        self.focus_force()
+        self.grab_set()
+
+        self.old_var = tk.StringVar(value=suggestion[0] if suggestion else "")
+        self.new_var = tk.StringVar(value=suggestion[1] if suggestion else "")
+
+        wrap = ttk.Frame(self, padding=10)
+        wrap.pack(fill="both", expand=True)
+        if suggestion:
+            ttk.Label(wrap, foreground="#0a6b0a", wraplength=520,
+                       text=(f"Auto-detected: your data appears to have "
+                             f"moved from {suggestion[0]} to "
+                             f"{suggestion[1]}. Confirm or edit below.")
+                       ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        ttk.Label(wrap, text="Old prefix").grid(row=1, column=0, sticky="w", pady=4)
+        ttk.Entry(wrap, textvariable=self.old_var, width=40).grid(row=1, column=1, sticky="ew", padx=6)
+        ttk.Label(wrap, text="New prefix").grid(row=2, column=0, sticky="w", pady=4)
+        ttk.Entry(wrap, textvariable=self.new_var, width=40).grid(row=2, column=1, sticky="ew", padx=6)
+        ttk.Label(wrap, foreground="#666666", wraplength=520,
+                   text=("Every item whose original_path starts with the "
+                         "Old prefix will have that prefix replaced with "
+                         "New. The manifest is saved to disk after the "
+                         "swap.")
+                   ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 4))
+        wrap.columnconfigure(1, weight=1)
+
+        btns = ttk.Frame(wrap)
+        btns.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        ttk.Button(btns, text="Apply", command=self._ok).pack(side="right")
+        ttk.Button(btns, text="Cancel", command=self._cancel).pack(side="right", padx=6)
+
+        self.wait_window(self)
+
+    def _ok(self):
+        self.result = (self.old_var.get().strip(), self.new_var.get().strip())
+        self.destroy()
+
+    def _cancel(self):
+        self.result = (None, None)
+        self.destroy()
 
 
 class TakeoverDialog(tk.Toplevel):
