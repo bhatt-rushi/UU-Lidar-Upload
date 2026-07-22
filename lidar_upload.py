@@ -156,7 +156,11 @@ PROCESSED_EXTS = {".las", ".laz"}
 
 DEFAULT_ADVANCED = {
     "local_retries": 50,          # X: per-item retries within a single session
-    "timeout_seconds": 3600,      # T: azcopy per-call timeout
+    "timeout_seconds_per_gb": 1200,  # scales the per-call azcopy timeout with
+                                     # file size: seconds allowed per GB of
+                                     # payload. 1200 = 20 min/GB. Floored at
+                                     # AZCOPY_TIMEOUT_FLOOR so small files
+                                     # still get a reasonable minimum.
     "create_readmes": CREATE_DIR_READMES_DEFAULT,
     "zip_scratch_dir": "",        # "" -> system temp
     "retry_failed_forever": True, # after first pass, keep retrying items
@@ -170,6 +174,23 @@ DEFAULT_ADVANCED = {
                                   # starves on a fast link, but each ready
                                   # zip takes disk space in the scratch dir
 }
+
+# Floor for the per-call azcopy timeout in seconds. Small files still get at
+# least this much, even if size_gb * rate_per_gb would compute a smaller value.
+AZCOPY_TIMEOUT_FLOOR = 300
+
+
+def compute_azcopy_timeout(size_bytes: int, rate_per_gb: int) -> int:
+    """seconds allotted to one azcopy call for a payload of ``size_bytes``,
+    given the pilot's configured seconds-per-GB rate. Floored at
+    AZCOPY_TIMEOUT_FLOOR."""
+    try:
+        gb = max(0.001, float(size_bytes) / (1024 ** 3))
+        computed = int(gb * int(rate_per_gb))
+    except Exception:
+        computed = 0
+    return max(AZCOPY_TIMEOUT_FLOOR, computed)
+
 
 STATUS_PENDING = "pending"
 STATUS_ZIPPING = "zipping"
@@ -287,13 +308,18 @@ class AzcopyError(RuntimeError):
 
 
 def _run_azcopy_streaming(args: list[str], timeout: int,
-                          on_progress=None) -> None:
+                          on_progress=None, on_log=None) -> None:
     """Run azcopy with JSON-line stdout so we can surface live progress.
 
     ``on_progress(bytes_over_wire)`` is called each time azcopy emits a
-    Progress message. Its argument is the cumulative bytes-over-wire count
-    for the whole azcopy job (which, for our single-file copies, equals the
-    bytes uploaded so far for this transfer).
+    Progress message; its argument is the cumulative bytes-over-wire
+    count for the whole azcopy job (which, for our single-file copies,
+    equals the bytes uploaded so far for this transfer).
+
+    ``on_log(str)`` is called for each azcopy Info / Warning / Error /
+    end-of-job message so real cause of an rc != 0 shows up in the
+    session log instead of just "rc=1". The last few captured messages
+    are also appended to the AzcopyError raised on a non-zero exit.
     """
     exe = azcopy_path()
     if not exe.exists():
@@ -318,6 +344,8 @@ def _run_azcopy_streaming(args: list[str], timeout: int,
         bufsize=1,
     )
     stderr_chunks: list[str] = []
+    # Captured non-Progress messages; last few surface on failure.
+    azcopy_msgs: list[str] = []
 
     def _drain_stderr():
         try:
@@ -328,6 +356,14 @@ def _run_azcopy_streaming(args: list[str], timeout: int,
             pass
 
     threading.Thread(target=_drain_stderr, daemon=True).start()
+
+    def _emit(msg: str):
+        azcopy_msgs.append(msg)
+        if on_log:
+            try:
+                on_log(msg)
+            except Exception:
+                pass
 
     deadline = time.monotonic() + timeout
     try:
@@ -343,13 +379,39 @@ def _run_azcopy_streaming(args: list[str], timeout: int,
                 msg = json.loads(line)
             except Exception:
                 continue
-            if on_progress and msg.get("MessageType") == "Progress":
+            mt = msg.get("MessageType", "")
+            content = msg.get("MessageContent", "")
+            if mt == "Progress":
+                if on_progress:
+                    try:
+                        c = json.loads(content) if content else {}
+                        on_progress(int(c.get("BytesOverWire", 0)))
+                    except Exception:
+                        pass
+            elif mt in ("Info", "Warning", "Error"):
+                # Content is usually a plain string. Trim so we don't blow
+                # up the log with huge messages.
+                _emit(f"[azcopy {mt.lower()}] {str(content)[:400]}")
+            elif mt == "EndOfJob":
+                # Only interesting when the job didn't finish clean; that's
+                # where azcopy stashes FailedTransfers with real error text.
                 try:
-                    content = json.loads(msg.get("MessageContent", "{}"))
-                    bytes_over_wire = int(content.get("BytesOverWire", 0))
-                    on_progress(bytes_over_wire)
+                    end = json.loads(content) if content else {}
                 except Exception:
-                    pass
+                    end = {}
+                status = end.get("JobStatus", "")
+                if status and status not in ("Completed", "CompletedWithSkipped"):
+                    ft = end.get("FailedTransfers") or []
+                    ft_summary = ""
+                    if ft:
+                        first = ft[0] or {}
+                        ft_summary = (f" first-failed: "
+                                       f"src={first.get('Src', '')[:120]} "
+                                       f"code={first.get('ErrorCode', '')} "
+                                       f"text={str(first.get('ErrorText', ''))[:200]}")
+                    _emit(f"[azcopy end-of-job] status={status} "
+                          f"failed_count={end.get('TransfersFailed', len(ft))}"
+                          f"{ft_summary}")
     finally:
         try:
             proc.wait(timeout=10)
@@ -358,24 +420,31 @@ def _run_azcopy_streaming(args: list[str], timeout: int,
 
     if proc.returncode != 0:
         err = "".join(stderr_chunks).strip()
-        raise AzcopyError(f"azcopy failed (rc={proc.returncode}): {err[:400]}")
+        tail = "\n  ".join(azcopy_msgs[-6:]) if azcopy_msgs else ""
+        detail = f" | recent azcopy log:\n  {tail}" if tail else ""
+        raise AzcopyError(
+            f"azcopy failed (rc={proc.returncode}): {err[:400]}{detail}"
+        )
 
 
 def azcopy_upload_file(local: Path, dest_url: str, timeout: int,
-                       put_md5: bool = True, on_progress=None) -> None:
+                       put_md5: bool = True,
+                       on_progress=None, on_log=None) -> None:
     args = ["copy", str(local), dest_url, "--log-level=ERROR"]
     if put_md5:
         args.append("--put-md5")
-    _run_azcopy_streaming(args, timeout=timeout, on_progress=on_progress)
+    _run_azcopy_streaming(args, timeout=timeout,
+                          on_progress=on_progress, on_log=on_log)
 
 
 def azcopy_download_file(src_url: str, local: Path, timeout: int,
-                          on_progress=None) -> None:
+                          on_progress=None, on_log=None) -> None:
     """Same wrapper, download direction. azcopy accepts (source, destination)
     with the source being the SAS-signed blob URL."""
     local.parent.mkdir(parents=True, exist_ok=True)
     args = ["copy", src_url, str(local), "--log-level=ERROR"]
-    _run_azcopy_streaming(args, timeout=timeout, on_progress=on_progress)
+    _run_azcopy_streaming(args, timeout=timeout,
+                          on_progress=on_progress, on_log=on_log)
 
 
 # --- blob REST (manifest + verify) -------------------------------------------
@@ -1518,7 +1587,12 @@ class UploadSession:
         dest = blob_url(m["client"], m["program"], m["feeder"],
                         DIR_SENSOR_DATA, m["collection_date"], f"{name}.zip")
         head_url = dest  # HEAD with SAS
-        timeout = self.advanced["timeout_seconds"]
+        timeout = compute_azcopy_timeout(
+            item.get("zip_size_bytes") or 0,
+            self.advanced.get("timeout_seconds_per_gb", 1200) or 1200,
+        )
+        self._log(f"[upload] {name}: allotted {timeout}s "
+                  f"({_fmt_bytes(item.get('zip_size_bytes') or 0)})")
         for attempt in range(1, self.advanced["local_retries"] + 1):
             if self._stop.is_set():
                 return
@@ -1529,7 +1603,8 @@ class UploadSession:
             self._start_transfer(name, item.get("zip_size_bytes") or 0)
             try:
                 azcopy_upload_file(zip_path, dest, timeout=timeout, put_md5=True,
-                                   on_progress=self._update_transfer)
+                                   on_progress=self._update_transfer,
+                                   on_log=self._log)
             except Exception as e:
                 self._end_transfer()
                 item["last_error"] = f"upload attempt {attempt}: {e}"
@@ -1567,7 +1642,7 @@ class UploadSession:
 
     def _base_upload(self, m: dict, path: Path):
         self._log(f"[base] uploading {len(m['items'])} files for {m['collection_date']}")
-        timeout = self.advanced["timeout_seconds"]
+        rate_per_gb = self.advanced.get("timeout_seconds_per_gb", 1200) or 1200
         for name, item in m["items"].items():
             if self._stop.is_set():
                 return
@@ -1587,8 +1662,11 @@ class UploadSession:
             _hex, b64, size = md5_file(src)
             item["md5_b64"] = b64
             item["size_bytes"] = size
+            timeout = compute_azcopy_timeout(size, rate_per_gb)
             dest = blob_url(m["client"], m["program"], m["feeder"],
                             DIR_BASE_STATION, m["collection_date"], name)
+            self._log(f"[base] {name}: allotted {timeout}s "
+                      f"({_fmt_bytes(size)})")
             for attempt in range(1, self.advanced["local_retries"] + 1):
                 if self._stop.is_set():
                     return
@@ -1599,7 +1677,8 @@ class UploadSession:
                 self._start_transfer(name, item.get("size_bytes") or 0)
                 try:
                     azcopy_upload_file(src, dest, timeout=timeout, put_md5=True,
-                                       on_progress=self._update_transfer)
+                                       on_progress=self._update_transfer,
+                                       on_log=self._log)
                 except Exception as e:
                     self._end_transfer()
                     item["last_error"] = f"upload attempt {attempt}: {e}"
@@ -2031,7 +2110,9 @@ class DownloadSession:
             size = item.get("size_bytes") or 0
             zip_dest = date_dir / name
 
-        timeout = self.advanced["timeout_seconds"]
+        timeout = compute_azcopy_timeout(
+            size, self.advanced.get("timeout_seconds_per_gb", 1200) or 1200)
+        self._log(f"[dl] {name}: allotted {timeout}s ({_fmt_bytes(size)})")
         for attempt in range(1, self.advanced["local_retries"] + 1):
             if self._stop.is_set():
                 return
@@ -2046,7 +2127,8 @@ class DownloadSession:
                 except Exception:
                     pass
                 azcopy_download_file(src_url, zip_dest, timeout=timeout,
-                                     on_progress=self._update_transfer)
+                                     on_progress=self._update_transfer,
+                                     on_log=self._log)
                 _hex, got_md5, got_size = md5_file(zip_dest)
                 if expected_md5 and got_md5 != expected_md5:
                     raise RuntimeError(
@@ -2495,7 +2577,8 @@ class AdvancedDialog(tk.Toplevel):
         vars_ = {}
         rows = [
             ("Local retries per item (X)", "local_retries", int),
-            ("azcopy per-call timeout seconds (T)", "timeout_seconds", int),
+            ("azcopy timeout seconds per GB (auto-scales with file size, min 5m)",
+             "timeout_seconds_per_gb", int),
             ("Retry-failed interval seconds (between passes)", "retry_failed_interval_seconds", int),
             ("Zip queue depth (missions pre-zipped ahead of upload)", "zip_queue_depth", int),
             ("Zip scratch dir (blank = temp)", "zip_scratch_dir", str),
