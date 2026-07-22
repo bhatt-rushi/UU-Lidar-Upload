@@ -2218,8 +2218,6 @@ class App(tk.Tk):
         ttk.Separator(frame).pack(fill="x", pady=14)
         ttk.Button(frame, text="New upload (adds to queue)", width=40,
                    command=self._start_new_wizard).pack(pady=6)
-        ttk.Button(frame, text="Resume from manifest... (adds to queue)", width=40,
-                   command=self._start_resume).pack(pady=6)
         # Bound to a StringVar so it stays fresh as items are added / removed
         # without needing to rebuild the whole start frame.
         self.queue_btn_var = tk.StringVar(
@@ -2309,16 +2307,6 @@ class App(tk.Tk):
         )
         self.session = session
         session.start()
-
-    def _start_resume(self):
-        ResumeDialog(self, on_pick=self._on_resume_picked)
-
-    def _on_resume_picked(self, m: dict, path: Path):
-        remapped = DriveRemapDialog(self, m).result
-        if remapped is False:
-            return
-        save_local_manifest(m, path)
-        self._enqueue([(m, path)])
 
     # --- progress screen ---
 
@@ -3246,141 +3234,6 @@ class DeletionCheckDialog(tk.Toplevel):
         self.result_text.see("end")
 
 
-# --- resume-from-manifest browser -------------------------------------------
-
-
-class ResumeDialog(tk.Toplevel):
-    """Registry browser for the Resume flow. Same searchable table as
-    DeletionCheckDialog, but the primary action is 'Resume selected' which
-    hands the chosen manifest back to the App to start an UploadSession.
-    Also keeps a 'Browse for file...' escape hatch for manifests that live
-    outside the registry (e.g. one the pilot downloaded from the blob)."""
-
-    COLUMNS = ("feeder", "kind", "date", "pilot", "verified", "updated")
-
-    def __init__(self, parent: App, on_pick):
-        super().__init__(parent)
-        self.title("Resume from manifest")
-        self.geometry("1000x560")
-        self.on_pick = on_pick
-
-        self.transient(parent)
-        self.lift()
-        self.attributes("-topmost", True)
-        self.after(300, lambda: self.attributes("-topmost", False))
-        self.focus_force()
-        self.grab_set()
-
-        self._paths: list[Path] = []
-        self._manifests: dict[str, dict] = {}
-
-        top = ttk.Frame(self, padding=8)
-        top.pack(fill="x")
-        ttk.Label(top, text=f"Manifest registry:  {registry_dir()}").pack(anchor="w")
-
-        search = ttk.Frame(self, padding=(8, 4))
-        search.pack(fill="x")
-        ttk.Label(search, text="Search (feeder / date / pilot / kind):").pack(side="left")
-        self.search_var = tk.StringVar()
-        self.search_var.trace_add("write", lambda *_: self._refill())
-        ttk.Entry(search, textvariable=self.search_var, width=40).pack(side="left", padx=6)
-        ttk.Button(search, text="Refresh", command=self._reload).pack(side="left", padx=4)
-
-        tree_frame = ttk.Frame(self)
-        tree_frame.pack(fill="both", expand=True, padx=8, pady=4)
-        self.tree = ttk.Treeview(tree_frame, columns=self.COLUMNS, show="headings",
-                                 selectmode="browse", height=14)
-        for col, w in zip(self.COLUMNS, (100, 90, 110, 140, 100, 170)):
-            self.tree.heading(col, text=col.title())
-            self.tree.column(col, width=w, anchor="w")
-        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=vsb.set)
-        self.tree.pack(side="left", fill="both", expand=True)
-        vsb.pack(side="right", fill="y")
-        self.tree.bind("<Double-1>", lambda _e: self._resume_selected())
-
-        btns = ttk.Frame(self, padding=8)
-        btns.pack(fill="x")
-        ttk.Button(btns, text="Resume selected", command=self._resume_selected).pack(side="left")
-        ttk.Button(btns, text="Browse for file...", command=self._browse_file).pack(side="left", padx=6)
-        ttk.Button(btns, text="Cancel", command=self.destroy).pack(side="right")
-
-        self._reload()
-
-    def _reload(self):
-        self._paths = list_registered_manifests()
-        self._manifests.clear()
-        for p in self._paths:
-            try:
-                self._manifests[str(p)] = load_local_manifest(p)
-            except Exception:
-                self._manifests[str(p)] = {}
-        self._refill()
-
-    def _row_matches(self, m: dict, query: str) -> bool:
-        if not query:
-            return True
-        blob = " ".join(str(m.get(k, "")) for k in
-                        ("feeder", "kind", "collection_date", "pilot_name",
-                         "sensor", "data_type", "client", "program")).lower()
-        return query.lower() in blob
-
-    def _refill(self):
-        q = self.search_var.get().strip()
-        for iid in self.tree.get_children():
-            self.tree.delete(iid)
-        for p in self._paths:
-            m = self._manifests.get(str(p), {})
-            if not self._row_matches(m, q):
-                continue
-            summary = m.get("summary", {}) or {}
-            verified = f"{summary.get('verified', 0)} / {summary.get('total', 0)}"
-            self.tree.insert("", "end", iid=str(p), values=(
-                m.get("feeder", "?"),
-                m.get("kind", "?"),
-                m.get("collection_date", "?"),
-                m.get("pilot_name", "?"),
-                verified,
-                _fmt_local_time(m.get("updated_utc", "")),
-            ))
-
-    def _resume_selected(self):
-        sel = self.tree.selection()
-        if not sel:
-            messagebox.showerror("Pick one", "Select a manifest row first.")
-            return
-        path = Path(sel[0])
-        try:
-            m = load_local_manifest(path)
-        except Exception as e:
-            messagebox.showerror("Load failed", str(e))
-            return
-        self._pick(m, path)
-
-    def _browse_file(self):
-        path = filedialog.askopenfilename(
-            title="Select manifest.json (any manifest, e.g. one downloaded from the blob)",
-            filetypes=[("JSON", "*.json"), ("All files", "*.*")],
-        )
-        if not path:
-            return
-        try:
-            m = load_local_manifest(Path(path))
-        except Exception as e:
-            messagebox.showerror("Load failed", str(e))
-            return
-        self._pick(m, Path(path))
-
-    def _pick(self, m: dict, path: Path):
-        if m.get("version") != MANIFEST_VERSION:
-            messagebox.showerror("Bad manifest",
-                                 f"Unsupported manifest version: {m.get('version')}")
-            return
-        self.destroy()
-        self.on_pick(m, path)
-
-
-
 # --- uploads browser dialog -------------------------------------------------
 #
 # Merged replacement for the old separate DownloadDialog and
@@ -4172,63 +4025,6 @@ def _adopt_items(m: dict, source_root: Path | None, current_pilot: str) -> int:
         item["disk_name"] = get_disk_name(match)
         adopted += 1
     return adopted
-
-
-# --- drive remap dialog ------------------------------------------------------
-
-
-class DriveRemapDialog(tk.Toplevel):
-    def __init__(self, parent: App, manifest: dict):
-        super().__init__(parent)
-        self.title("Resume: verify source paths")
-        self.manifest = manifest
-        self.result: bool | None = None
-
-        roots = sorted(set(manifest.get("source_roots", [])))
-
-        ttk.Label(self, text=f"Manifest: {manifest['kind']} / {manifest['feeder']} / {manifest['collection_date']}",
-                  font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=10, pady=6)
-        ttk.Label(self, text="Source paths referenced by this manifest:").pack(anchor="w", padx=10)
-        for r in roots:
-            exists = Path(r).exists()
-            ttk.Label(self, text=f"  {r}   {'(found)' if exists else '(MISSING)'}",
-                      foreground="green" if exists else "red").pack(anchor="w", padx=10)
-
-        ttk.Separator(self).pack(fill="x", pady=6)
-        ttk.Label(self, text="Optional: remap a path prefix (e.g. E:\\ -> F:\\)").pack(anchor="w", padx=10)
-        rowf = ttk.Frame(self); rowf.pack(fill="x", padx=10, pady=4)
-        self.old_var = tk.StringVar()
-        self.new_var = tk.StringVar()
-        ttk.Label(rowf, text="Old prefix").grid(row=0, column=0, sticky="w")
-        ttk.Entry(rowf, textvariable=self.old_var, width=40).grid(row=0, column=1, sticky="ew", padx=4)
-        ttk.Label(rowf, text="New prefix").grid(row=1, column=0, sticky="w")
-        ttk.Entry(rowf, textvariable=self.new_var, width=40).grid(row=1, column=1, sticky="ew", padx=4)
-        rowf.columnconfigure(1, weight=1)
-
-        btns = ttk.Frame(self); btns.pack(fill="x", padx=10, pady=10)
-        ttk.Button(btns, text="Apply remap", command=self._apply).pack(side="left")
-        ttk.Button(btns, text="Continue without remap", command=self._skip).pack(side="left", padx=6)
-        ttk.Button(btns, text="Cancel", command=self._cancel).pack(side="right")
-
-        self.transient(parent); self.grab_set(); self.wait_window(self)
-
-    def _apply(self):
-        old = self.old_var.get()
-        new = self.new_var.get()
-        if not old or not new:
-            messagebox.showerror("Missing", "Enter both old and new prefixes.")
-            return
-        _remap_paths(self.manifest, old, new)
-        self.result = True
-        self.destroy()
-
-    def _skip(self):
-        self.result = True
-        self.destroy()
-
-    def _cancel(self):
-        self.result = False
-        self.destroy()
 
 
 def _remap_paths(m: dict, old: str, new: str):
