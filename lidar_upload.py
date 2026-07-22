@@ -156,9 +156,9 @@ PROCESSED_EXTS = {".las", ".laz"}
 
 DEFAULT_ADVANCED = {
     "local_retries": 50,          # X: per-item retries within a single session
-    "timeout_seconds_per_gb": 1200,  # scales the per-call azcopy timeout with
+    "timeout_seconds_per_gb": 3600,  # scales the per-call azcopy timeout with
                                      # file size: seconds allowed per GB of
-                                     # payload. 1200 = 20 min/GB. Floored at
+                                     # payload. 3600 = 1 hour/GB. Floored at
                                      # AZCOPY_TIMEOUT_FLOOR so small files
                                      # still get a reasonable minimum.
     "create_readmes": CREATE_DIR_READMES_DEFAULT,
@@ -1589,7 +1589,7 @@ class UploadSession:
         head_url = dest  # HEAD with SAS
         timeout = compute_azcopy_timeout(
             item.get("zip_size_bytes") or 0,
-            self.advanced.get("timeout_seconds_per_gb", 1200) or 1200,
+            self.advanced.get("timeout_seconds_per_gb", 3600) or 3600,
         )
         self._log(f"[upload] {name}: allotted {timeout}s "
                   f"({_fmt_bytes(item.get('zip_size_bytes') or 0)})")
@@ -1642,7 +1642,7 @@ class UploadSession:
 
     def _base_upload(self, m: dict, path: Path):
         self._log(f"[base] uploading {len(m['items'])} files for {m['collection_date']}")
-        rate_per_gb = self.advanced.get("timeout_seconds_per_gb", 1200) or 1200
+        rate_per_gb = self.advanced.get("timeout_seconds_per_gb", 3600) or 3600
         for name, item in m["items"].items():
             if self._stop.is_set():
                 return
@@ -2111,7 +2111,7 @@ class DownloadSession:
             zip_dest = date_dir / name
 
         timeout = compute_azcopy_timeout(
-            size, self.advanced.get("timeout_seconds_per_gb", 1200) or 1200)
+            size, self.advanced.get("timeout_seconds_per_gb", 3600) or 3600)
         self._log(f"[dl] {name}: allotted {timeout}s ({_fmt_bytes(size)})")
         for attempt in range(1, self.advanced["local_retries"] + 1):
             if self._stop.is_set():
