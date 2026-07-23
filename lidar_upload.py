@@ -2735,8 +2735,15 @@ class NewUploadWizard(tk.Toplevel):
     def _pick_base_file(self):
         f = filedialog.askopenfilename(
             title="Select a single base station file",
+            # Windows' native file dialog doesn't understand [0-9] character
+            # classes -- it treats them as literals and silently shows
+            # nothing. Use ? (single-char wildcard) instead: *.??o matches
+            # .25o / .26o / .27o / .. and also works on non-Windows.
             filetypes=[
-                ("Base station files", "*.dat *.rnx *.[0-9][0-9]o *.[0-9][0-9]O"),
+                ("Base station files", "*.dat *.rnx *.??o *.??O"),
+                ("CHC .dat", "*.dat"),
+                ("RINEX observation (.YYo)", "*.??o *.??O"),
+                ("RINEX long-name (.rnx)", "*.rnx"),
                 ("All files", "*.*"),
             ],
         )
