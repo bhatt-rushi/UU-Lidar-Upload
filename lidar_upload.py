@@ -312,7 +312,7 @@ class AzcopyError(RuntimeError):
 
 
 def _run_azcopy_streaming(args: list[str], timeout: int,
-                          on_progress=None, on_log=None) -> None:
+                          on_progress=None, on_log=None) -> str | None:
     """Run azcopy with JSON-line stdout so we can surface live progress.
 
     ``on_progress(bytes_over_wire)`` is called each time azcopy emits a
@@ -350,6 +350,12 @@ def _run_azcopy_streaming(args: list[str], timeout: int,
     stderr_chunks: list[str] = []
     # Captured non-Progress messages; last few surface on failure.
     azcopy_msgs: list[str] = []
+    # First JobID we see in any message's JSON content -- used by callers
+    # to persist and later hand to `azcopy jobs resume` on retry so we
+    # don't re-transfer blocks that already landed.
+    captured_job_id: str | None = None
+    job_id_re = re.compile(r"\b([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+                            r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\b")
 
     def _drain_stderr():
         try:
@@ -385,6 +391,19 @@ def _run_azcopy_streaming(args: list[str], timeout: int,
                 continue
             mt = msg.get("MessageType", "")
             content = msg.get("MessageContent", "")
+            # Any message may carry a JobID (Init is the earliest); grab it
+            # once. Try JSON first, then loose regex on plain-text content.
+            if captured_job_id is None and content:
+                try:
+                    c = json.loads(content) if isinstance(content, str) and content.startswith("{") else content
+                    if isinstance(c, dict) and c.get("JobID"):
+                        captured_job_id = str(c["JobID"])
+                except Exception:
+                    pass
+                if captured_job_id is None:
+                    jm = job_id_re.search(str(content))
+                    if jm:
+                        captured_job_id = jm.group(1)
             if mt == "Progress":
                 if on_progress:
                     try:
@@ -429,26 +448,47 @@ def _run_azcopy_streaming(args: list[str], timeout: int,
         raise AzcopyError(
             f"azcopy failed (rc={proc.returncode}): {err[:400]}{detail}"
         )
+    return captured_job_id
 
 
 def azcopy_upload_file(local: Path, dest_url: str, timeout: int,
                        put_md5: bool = True,
-                       on_progress=None, on_log=None) -> None:
+                       on_progress=None, on_log=None) -> str | None:
     args = ["copy", str(local), dest_url, "--log-level=ERROR"]
     if put_md5:
         args.append("--put-md5")
-    _run_azcopy_streaming(args, timeout=timeout,
-                          on_progress=on_progress, on_log=on_log)
+    return _run_azcopy_streaming(args, timeout=timeout,
+                                  on_progress=on_progress, on_log=on_log)
 
 
 def azcopy_download_file(src_url: str, local: Path, timeout: int,
-                          on_progress=None, on_log=None) -> None:
+                          on_progress=None, on_log=None) -> str | None:
     """Same wrapper, download direction. azcopy accepts (source, destination)
     with the source being the SAS-signed blob URL."""
     local.parent.mkdir(parents=True, exist_ok=True)
     args = ["copy", src_url, str(local), "--log-level=ERROR"]
-    _run_azcopy_streaming(args, timeout=timeout,
-                          on_progress=on_progress, on_log=on_log)
+    return _run_azcopy_streaming(args, timeout=timeout,
+                                  on_progress=on_progress, on_log=on_log)
+
+
+def azcopy_resume_upload(job_id: str, sas_token: str, timeout: int,
+                          on_progress=None, on_log=None) -> str | None:
+    """Resume a previously-started upload by JobID so blocks that already
+    landed on the blob aren't retransmitted. Requires the job plan file
+    for this JobID to still exist under azcopy's plan directory
+    (~/.azcopy/plans/ or %USERPROFILE%\\.azcopy\\plans\\). The SAS is
+    re-supplied via --destination-sas because azcopy doesn't persist
+    credentials in the plan for security. Raises AzcopyError if the
+    plan is missing / expired / the resume otherwise fails; caller
+    should catch and fall back to a fresh copy."""
+    sas = sas_token.lstrip("?")
+    args = [
+        "jobs", "resume", job_id,
+        f"--destination-sas={sas}",
+        "--log-level=ERROR",
+    ]
+    return _run_azcopy_streaming(args, timeout=timeout,
+                                  on_progress=on_progress, on_log=on_log)
 
 
 # --- blob REST (manifest + verify) -------------------------------------------
@@ -763,6 +803,10 @@ def mint_sensor_item(source_path: str, file_count: int, system_name: str,
         "zip_size_bytes": None,
         "uploaded_utc": None,
         "last_error": None,
+        # Set to azcopy's JobID after the first upload attempt so
+        # subsequent retries (this session, next session, next boot) can
+        # `azcopy jobs resume <id>` and skip blocks that already landed.
+        "azcopy_job_id": None,
     }
 
 
@@ -1161,7 +1205,8 @@ def merge_cloud_into(local: dict, cloud: dict) -> dict:
         if not citem:
             continue
         for k in ("status", "zip_md5_b64", "zip_size_bytes",
-                  "md5_b64", "size_bytes", "uploaded_utc", "last_error"):
+                  "md5_b64", "size_bytes", "uploaded_utc", "last_error",
+                  "azcopy_job_id"):
             if k in citem and citem[k] is not None:
                 litem[k] = citem[k]
     # any items that exist ONLY in cloud (e.g. this local was rebuilt from a
@@ -1568,6 +1613,36 @@ class UploadSession:
             except Exception:
                 pass
 
+    def _sensor_run_azcopy(self, zip_path: Path, dest_url: str,
+                            timeout: int, item: dict, name: str) -> None:
+        """Do one azcopy transfer for a sensor item, preferring
+        `azcopy jobs resume` when we have a stored JobID from a prior
+        attempt so blocks that already landed don't get resent. Falls
+        back to a fresh copy if resume fails (missing plan, expired
+        SAS, etc.) and stashes the new JobID on the item for future
+        retries. Propagates AzcopyError from the caller's perspective."""
+        stored_job = item.get("azcopy_job_id")
+        if stored_job:
+            self._log(f"[upload] {name}: resuming azcopy job {stored_job}")
+            try:
+                azcopy_resume_upload(
+                    stored_job, SAS_TOKEN, timeout=timeout,
+                    on_progress=self._update_transfer, on_log=self._log,
+                )
+                return
+            except Exception as e:
+                self._log(f"[upload] {name}: resume failed ({e}); "
+                          f"starting fresh copy")
+                item["azcopy_job_id"] = None
+        new_job = azcopy_upload_file(
+            zip_path, dest_url, timeout=timeout, put_md5=True,
+            on_progress=self._update_transfer, on_log=self._log,
+        )
+        if new_job:
+            item["azcopy_job_id"] = new_job
+            self._log(f"[upload] {name}: azcopy job id captured "
+                      f"({new_job}) for future resume")
+
     def _upload_sensor_item(self, m: dict, path: Path, name: str, zip_path: Path):
         item = m["items"][name]
         dest = blob_url(m["client"], m["program"], m["feeder"],
@@ -1588,9 +1663,7 @@ class UploadSession:
             up_start = time.monotonic()
             self._start_transfer(name, item.get("zip_size_bytes") or 0)
             try:
-                azcopy_upload_file(zip_path, dest, timeout=timeout, put_md5=True,
-                                   on_progress=self._update_transfer,
-                                   on_log=self._log)
+                self._sensor_run_azcopy(zip_path, dest, timeout, item, name)
             except Exception as e:
                 self._end_transfer()
                 item["last_error"] = f"upload attempt {attempt}: {e}"
@@ -1609,6 +1682,9 @@ class UploadSession:
                 item["status"] = STATUS_VERIFIED
                 item["uploaded_utc"] = utcnow()
                 item["last_error"] = None
+                # Item is done; the job plan is no longer useful and would
+                # only confuse a future re-upload (e.g. after Repair).
+                item["azcopy_job_id"] = None
                 self._record_upload(item.get("zip_size_bytes") or 0,
                                     time.monotonic() - up_start)
                 self._end_transfer()
@@ -1871,6 +1947,10 @@ def repair_manifest_for_reupload(m: dict, local_path: Path,
         item["status"] = STATUS_PENDING
         item["attempts"] = 0
         item["uploaded_utc"] = None
+        # Repair implies the blob is gone / bad, so a stored azcopy JobID
+        # is worthless -- the plan would resume against a blob that no
+        # longer matches. Force a fresh copy on next attempt.
+        item["azcopy_job_id"] = None
         item["last_error"] = f"Repaired by validation: {res.get('detail', res.get('category'))}"
         repaired.append(name)
     if repaired:
