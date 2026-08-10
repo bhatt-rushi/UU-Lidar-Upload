@@ -83,8 +83,17 @@ from tkinter import filedialog, messagebox, ttk
 
 BLOB_URL_BASE = f"https://{STORAGE_ACCOUNT}.blob.core.windows.net/{CONTAINER}"
 
-VALID_CLIENTS = ["xcel"]
-VALID_PROGRAMS = ["2026"]
+VALID_CLIENTS = ["xcel", "entergy"]
+# Programs vary by client, so keep them keyed. The wizard / uploads browser
+# dropdowns update the program list whenever the client changes.
+VALID_PROGRAMS_BY_CLIENT: dict[str, list[str]] = {
+    "xcel": ["2026"],
+    "entergy": ["TEF/2026"],
+}
+
+
+def programs_for_client(client: str) -> list[str]:
+    return VALID_PROGRAMS_BY_CLIENT.get(client, [])
 # Suggested pilot names. Pilots can also type in a custom name if they don't
 # find themselves here -- edit this list to keep it current.
 VALID_PILOTS = [
@@ -100,17 +109,26 @@ VALID_PILOTS = [
 # Known feeder names. The wizard autocompletes against this list, but a pilot
 # can type a custom feeder for troubleshooting / one-offs (warning is emitted
 # if it doesn't match the LLLDDD pattern). Edit this list to keep it current.
-VALID_FEEDERS = [
-    "BRT060", "CNT061", "CNT071", "CUM081", "CUM082", "FLS062", "FLS074",
-    "GRT311", "LAW312", "LAW321", "LAW322", "LCO061", "LCO062", "LCO063",
-    "LCO071", "LCO072", "LCO073", "LOU061", "LOU062", "LOU071", "LOU072",
-    "LUK021", "MHA061", "MHA062", "MHA063", "MHA072", "MHA073", "MRC021",
-    "MRC022", "PSI020", "RCL031", "RTL021", "RTL022", "SAL310", "SCF031",
-    "SCF032", "SCF033", "SOR060", "SOR061", "SOR062", "SOR063", "SOR070",
-    "SOR071", "SOR072", "SOR073", "SOR080", "SOR081", "SOR082", "SOS070",
-    "SOS071", "SOS072", "TAD081", "WSF062", "WSF065", "WSF073", "WSF074",
-    "YLR081", "YLR082",
-]
+VALID_FEEDERS_BY_CLIENT_PROGRAM: dict[tuple[str, str], list[str]] = {
+    ("xcel", "2026"): [
+        "BRT060", "CNT061", "CNT071", "CUM081", "CUM082", "FLS062", "FLS074",
+        "GRT311", "LAW312", "LAW321", "LAW322", "LCO061", "LCO062", "LCO063",
+        "LCO071", "LCO072", "LCO073", "LOU061", "LOU062", "LOU071", "LOU072",
+        "LUK021", "MHA061", "MHA062", "MHA063", "MHA072", "MHA073", "MRC021",
+        "MRC022", "PSI020", "RCL031", "RTL021", "RTL022", "SAL310", "SCF031",
+        "SCF032", "SCF033", "SOR060", "SOR061", "SOR062", "SOR063", "SOR070",
+        "SOR071", "SOR072", "SOR073", "SOR080", "SOR081", "SOR082", "SOS070",
+        "SOS071", "SOS072", "TAD081", "WSF062", "WSF065", "WSF073", "WSF074",
+        "YLR081", "YLR082",
+    ],
+    ("entergy", "TEF/2026"): [
+        "P5003", "P5004",
+    ],
+}
+
+
+def feeders_for(client: str, program: str) -> list[str]:
+    return list(VALID_FEEDERS_BY_CLIENT_PROGRAM.get((client, program), []))
 SENSOR_CHOICES = [("L3", True), ("TV540", True), ("TVGO", False)]
 
 DATA_TYPE_RAW = "RAW_SENSOR"
@@ -864,8 +882,8 @@ def load_cloud_manifest_at(blob_path: str) -> dict | None:
 # per-date manifest that has been written under that program, with pilot /
 # system / progress / timing metadata pulled from the manifest. Session
 # writes upsert an entry on every save; the tracker dialog can also fully
-# rebuild by re-enumerating every VALID_FEEDERS. Concurrent writes are
-# handled with an If-Match / ETag retry loop.
+# rebuild by re-enumerating the feeders for that client/program.
+# Concurrent writes are handled with an If-Match / ETag retry loop.
 
 
 MASTER_INDEX_VERSION = 1
@@ -962,10 +980,12 @@ def load_master_index(client: str, program: str) -> dict:
 
 def rebuild_master_index(client: str, program: str,
                          progress_cb=None) -> dict:
-    """Re-enumerate every valid feeder and rewrite the index from scratch."""
+    """Re-enumerate every valid feeder for this (client, program) and
+    rewrite the index from scratch."""
     entries = []
-    total = len(VALID_FEEDERS)
-    for i, feeder in enumerate(VALID_FEEDERS):
+    feeders = feeders_for(client, program)
+    total = len(feeders)
+    for i, feeder in enumerate(feeders):
         if progress_cb:
             try:
                 progress_cb(i, total, feeder)
@@ -2370,6 +2390,13 @@ class AutocompleteCombobox(ttk.Combobox):
         self._uppercase = uppercase
         self.bind("<KeyRelease>", self._on_keyrelease)
 
+    def set_completion_values(self, values):
+        """Replace the autocomplete source list at runtime -- used when the
+        upstream selection (client / program) changes and a different set
+        of feeders should now suggest."""
+        self._all_values = sorted(set(values), key=str.casefold)
+        self.configure(values=self._all_values)
+
     def _on_keyrelease(self, event):
         if event.keysym in self._NAV_KEYS:
             return
@@ -2705,7 +2732,8 @@ class NewUploadWizard(tk.Toplevel):
         self.grab_set()
 
         self.client_var = tk.StringVar(value=VALID_CLIENTS[0])
-        self.program_var = tk.StringVar(value=VALID_PROGRAMS[0])
+        self.program_var = tk.StringVar(
+            value=programs_for_client(VALID_CLIENTS[0])[0])
         self.pilot_var = tk.StringVar()
         self.feeder_var = tk.StringVar()
         self.feeder_confirm_var = tk.StringVar()
@@ -2718,12 +2746,16 @@ class NewUploadWizard(tk.Toplevel):
         pad = {"padx": 8, "pady": 4}
         row = 0
         ttk.Label(self, text="Client").grid(row=row, column=0, sticky="w", **pad)
-        ttk.Combobox(self, values=VALID_CLIENTS, textvariable=self.client_var,
-                     state="readonly").grid(row=row, column=1, sticky="ew", **pad)
+        self.client_combo = ttk.Combobox(
+            self, values=VALID_CLIENTS, textvariable=self.client_var,
+            state="readonly")
+        self.client_combo.grid(row=row, column=1, sticky="ew", **pad)
         row += 1
         ttk.Label(self, text="Program").grid(row=row, column=0, sticky="w", **pad)
-        ttk.Combobox(self, values=VALID_PROGRAMS, textvariable=self.program_var,
-                     state="readonly").grid(row=row, column=1, sticky="ew", **pad)
+        self.program_combo = ttk.Combobox(
+            self, values=programs_for_client(self.client_var.get()),
+            textvariable=self.program_var, state="readonly")
+        self.program_combo.grid(row=row, column=1, sticky="ew", **pad)
         row += 1
         ttk.Label(self, text="Pilot name").grid(row=row, column=0, sticky="w", **pad)
         # state="normal" (not "readonly") + AutocompleteCombobox so pilots
@@ -2731,14 +2763,23 @@ class NewUploadWizard(tk.Toplevel):
         AutocompleteCombobox(self, VALID_PILOTS, textvariable=self.pilot_var,
                              state="normal").grid(row=row, column=1, sticky="ew", **pad)
         row += 1
-        ttk.Label(self, text="Feeder (e.g. LAW322)").grid(row=row, column=0, sticky="w", **pad)
-        AutocompleteCombobox(self, VALID_FEEDERS, textvariable=self.feeder_var,
-                             state="normal", uppercase=True).grid(row=row, column=1, sticky="ew", **pad)
+        ttk.Label(self, text="Feeder").grid(row=row, column=0, sticky="w", **pad)
+        initial_feeders = feeders_for(self.client_var.get(), self.program_var.get())
+        self.feeder_combo = AutocompleteCombobox(
+            self, initial_feeders, textvariable=self.feeder_var,
+            state="normal", uppercase=True)
+        self.feeder_combo.grid(row=row, column=1, sticky="ew", **pad)
         row += 1
         ttk.Label(self, text="Re-type feeder to confirm").grid(row=row, column=0, sticky="w", **pad)
-        AutocompleteCombobox(self, VALID_FEEDERS, textvariable=self.feeder_confirm_var,
-                             state="normal", uppercase=True).grid(row=row, column=1, sticky="ew", **pad)
+        self.feeder_confirm_combo = AutocompleteCombobox(
+            self, initial_feeders, textvariable=self.feeder_confirm_var,
+            state="normal", uppercase=True)
+        self.feeder_confirm_combo.grid(row=row, column=1, sticky="ew", **pad)
         row += 1
+
+        # React to client / program changes: refresh downstream dropdowns.
+        self.client_var.trace_add("write", lambda *_: self._on_client_change())
+        self.program_var.trace_add("write", lambda *_: self._on_program_change())
         ttk.Label(self, text="Sensor").grid(row=row, column=0, sticky="w", **pad)
         sensor_frame = ttk.Frame(self)
         sensor_frame.grid(row=row, column=1, sticky="w", **pad)
@@ -2789,6 +2830,23 @@ class NewUploadWizard(tk.Toplevel):
         ttk.Button(btns, text="Cancel", command=self.destroy).pack(side="right", padx=6)
 
         self.scanned: dict | None = None
+
+    def _on_client_change(self):
+        programs = programs_for_client(self.client_var.get())
+        self.program_combo.configure(values=programs)
+        # Default to the first program under the new client (also triggers
+        # _on_program_change via the trace).
+        if programs and self.program_var.get() not in programs:
+            self.program_var.set(programs[0])
+        else:
+            # Program already valid; still refresh feeders explicitly since
+            # (client, program) key changed.
+            self._on_program_change()
+
+    def _on_program_change(self):
+        feeders = feeders_for(self.client_var.get(), self.program_var.get())
+        self.feeder_combo.set_completion_values(feeders)
+        self.feeder_confirm_combo.set_completion_values(feeders)
 
     def _pick_source(self):
         d = filedialog.askdirectory(title="Select sensor source folder")
@@ -3492,7 +3550,8 @@ class UploadsBrowserDialog(tk.Toplevel):
         self.grab_set()
 
         self.client_var = tk.StringVar(value=VALID_CLIENTS[0])
-        self.program_var = tk.StringVar(value=VALID_PROGRAMS[0])
+        self.program_var = tk.StringVar(
+            value=programs_for_client(VALID_CLIENTS[0])[0])
         self.search_var = tk.StringVar()
         self.search_var.trace_add("write", lambda *_: self._refill())
         self.dest_var = tk.StringVar()
@@ -3506,8 +3565,13 @@ class UploadsBrowserDialog(tk.Toplevel):
         ttk.Combobox(top, textvariable=self.client_var, values=VALID_CLIENTS,
                      state="readonly", width=10).pack(side="left", padx=4)
         ttk.Label(top, text="Program").pack(side="left", padx=(10, 0))
-        ttk.Combobox(top, textvariable=self.program_var, values=VALID_PROGRAMS,
-                     state="readonly", width=8).pack(side="left", padx=4)
+        self.program_combo = ttk.Combobox(
+            top, textvariable=self.program_var,
+            values=programs_for_client(self.client_var.get()),
+            state="readonly", width=14)
+        self.program_combo.pack(side="left", padx=4)
+        # Refresh the program list whenever the client changes.
+        self.client_var.trace_add("write", lambda *_: self._on_client_change())
         ttk.Button(top, text="Load", command=self._load).pack(side="left", padx=(10, 4))
         ttk.Button(top, text="Refresh from cloud (rescan all feeders)",
                    command=self._rebuild).pack(side="left", padx=4)
@@ -3598,6 +3662,14 @@ class UploadsBrowserDialog(tk.Toplevel):
 
     # ---- data ----
 
+    def _on_client_change(self):
+        programs = programs_for_client(self.client_var.get())
+        self.program_combo.configure(values=programs)
+        if programs and self.program_var.get() not in programs:
+            # Reset to first program under the new client so we don't leave
+            # a stale (client, program) pair in place.
+            self.program_var.set(programs[0])
+
     def _load(self):
         self.status_var.set("Loading master index...")
         self.tree.delete(*self.tree.get_children())
@@ -3616,7 +3688,9 @@ class UploadsBrowserDialog(tk.Toplevel):
     def _rebuild(self):
         if not messagebox.askyesno(
             "Rebuild index",
-            f"Rescan every valid feeder ({len(VALID_FEEDERS)}) and rewrite "
+            f"Rescan every valid feeder for {self.client_var.get()} / "
+            f"{self.program_var.get()} "
+            f"({len(feeders_for(self.client_var.get(), self.program_var.get()))}) and rewrite "
             f"the master index from scratch? This can be slow on a bad link.",
         ):
             return
