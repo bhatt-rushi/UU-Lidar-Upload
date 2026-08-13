@@ -1606,17 +1606,36 @@ class UploadSession:
                     self._log(f"[zip] {name}: zipping -> {zip_path}")
                     item["status"] = STATUS_ZIPPING
                     try:
-                        _make_zip(src, zip_path)
+                        files_added = _make_zip(src, zip_path)
                     except Exception as e:
                         self._log(f"[zip] {name}: FAILED {e}")
                         item["status"] = STATUS_FAILED
                         item["last_error"] = f"zip failed: {e}"
                         continue
+                    # Sanity check: if the zipper wrote zero files (drive
+                    # popped out mid-scan, permission blip, rglob() coming
+                    # back empty, etc.), we'd otherwise ship a valid but
+                    # empty 22-byte archive that md5-verifies against
+                    # itself and gets marked verified. Fail hard instead
+                    # so retry_failed_forever picks it up next pass.
+                    expected_fc = int(item.get("file_count") or 0)
+                    if files_added == 0 or (expected_fc and files_added != expected_fc):
+                        try:
+                            zip_path.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                        msg = (f"zip file count mismatch: wrote {files_added} "
+                               f"file(s), manifest scan said {expected_fc}")
+                        self._log(f"[zip] {name}: {msg}")
+                        item["status"] = STATUS_FAILED
+                        item["last_error"] = msg
+                        continue
                     _hex, b64, size = md5_file(zip_path)
                     item["zip_md5_b64"] = b64
                     item["zip_size_bytes"] = size
                     item["status"] = STATUS_ZIPPED
-                    self._log(f"[zip] {name}: ready ({size / 1e6:.1f} MB, md5={b64})")
+                    self._log(f"[zip] {name}: ready ({size / 1e6:.1f} MB, "
+                              f"{files_added} files, md5={b64})")
                     self._zip_queue.put((m, path, name, zip_path))
             self._zip_queue.put(None)
         except Exception as e:
@@ -1863,6 +1882,22 @@ def verify_manifest_for_deletion(m: dict,
                     f"{name}: status is {item.get('status')!r}, not verified")
             continue
 
+        # Sanity check for the "silently empty zip" bug: if the manifest
+        # says the source had files but the zip we shipped is basically
+        # empty (an empty ZIP end-of-central-directory is 22 bytes), the
+        # blob is a valid archive that happens to contain nothing. Flag
+        # it as repairable so Repair can reset it to pending and force a
+        # re-upload from source. Applies only to sensor items.
+        if m["kind"] == KIND_SENSOR:
+            fc = int(item.get("file_count") or 0)
+            zs = int(item.get("zip_size_bytes") or 0)
+            if fc > 0 and 0 < zs < 100:
+                _record(name, "blob_suspiciously_empty",
+                        f"{name}: manifest says {fc} source file(s) but "
+                        f"the zip is only {zs} bytes -- likely empty/corrupt "
+                        f"zip on the blob")
+                continue
+
         blob_name = f"{name}.zip" if m["kind"] == KIND_SENSOR else name
         url = blob_url(m["client"], m["program"], m["feeder"],
                        subdir, m["collection_date"], blob_name)
@@ -1949,7 +1984,8 @@ def verify_manifest_for_deletion(m: dict,
 # Categories that mean "the cloud copy is bad, and we can fix it by
 # re-uploading the item". Anything else (local drift, not-verified,
 # transient HEAD errors) is not auto-repairable here.
-REPAIRABLE_CATEGORIES = {"blob_missing", "blob_mismatch"}
+REPAIRABLE_CATEGORIES = {"blob_missing", "blob_mismatch",
+                          "blob_suspiciously_empty"}
 
 
 def repair_manifest_for_reupload(m: dict, local_path: Path,
@@ -2311,16 +2347,24 @@ class DownloadSession:
 NO_COMPRESS_EXTS = {".jpg", ".jpeg"}
 
 
-def _make_zip(src_dir: Path, out_path: Path) -> None:
-    """Zip a mission folder for upload.
+def _make_zip(src_dir: Path, out_path: Path) -> int:
+    """Zip a mission folder for upload. Returns the count of files
+    actually written into the archive.
 
     Everything gets DEFLATE at level 9 except already-compressed formats
     (.jpg / .jpeg), which we ZIP_STORE because re-compressing them just
     burns CPU without shrinking the payload. On the slow / intermittent
     links this tool targets, a smaller zip is worth the CPU cost.
+
+    Returning the count lets the caller compare against the manifest's
+    ``file_count`` and fail hard on a silent mismatch -- otherwise a
+    transient rglob() coming back empty produces a valid but empty
+    22-byte archive that md5-verifies against itself on the blob and
+    gets silently marked verified.
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = out_path.with_suffix(out_path.suffix + ".part")
+    files_added = 0
     with zipfile.ZipFile(tmp, "w", allowZip64=True) as zf:
         for p in sorted(src_dir.rglob("*")):
             if not p.is_file():
@@ -2331,7 +2375,9 @@ def _make_zip(src_dir: Path, out_path: Path) -> None:
             else:
                 zf.write(p, arcname=arcname,
                          compress_type=zipfile.ZIP_DEFLATED, compresslevel=9)
+            files_added += 1
     tmp.replace(out_path)
+    return files_added
 
 
 # --- README placeholders -----------------------------------------------------
