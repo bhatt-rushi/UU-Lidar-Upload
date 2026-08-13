@@ -1606,36 +1606,49 @@ class UploadSession:
                     self._log(f"[zip] {name}: zipping -> {zip_path}")
                     item["status"] = STATUS_ZIPPING
                     try:
-                        files_added = _make_zip(src, zip_path)
+                        files_added, expected_arcnames, source_bytes = \
+                            _make_zip(src, zip_path)
                     except Exception as e:
                         self._log(f"[zip] {name}: FAILED {e}")
                         item["status"] = STATUS_FAILED
                         item["last_error"] = f"zip failed: {e}"
                         continue
-                    # Sanity check: if the zipper wrote zero files (drive
-                    # popped out mid-scan, permission blip, rglob() coming
-                    # back empty, etc.), we'd otherwise ship a valid but
-                    # empty 22-byte archive that md5-verifies against
-                    # itself and gets marked verified. Fail hard instead
-                    # so retry_failed_forever picks it up next pass.
+                    # Defense-in-depth: (a) the zipper's file count must
+                    # match the manifest's scan-time count, (b) the
+                    # archive's central directory must list exactly the
+                    # arcnames we intended, (c) the sum of uncompressed
+                    # sizes recorded in the zip must equal what we read
+                    # off disk. Any failure trashes the .zip and marks
+                    # the item failed so retry_failed_forever re-drives.
                     expected_fc = int(item.get("file_count") or 0)
+                    failure = None
                     if files_added == 0 or (expected_fc and files_added != expected_fc):
+                        failure = (f"zip file count mismatch: wrote "
+                                   f"{files_added} file(s), manifest scan "
+                                   f"said {expected_fc}")
+                    else:
+                        try:
+                            _validate_zip_contents(zip_path, expected_arcnames,
+                                                    source_bytes)
+                        except Exception as e:
+                            failure = f"zip validation: {e}"
+                    if failure:
                         try:
                             zip_path.unlink(missing_ok=True)
                         except Exception:
                             pass
-                        msg = (f"zip file count mismatch: wrote {files_added} "
-                               f"file(s), manifest scan said {expected_fc}")
-                        self._log(f"[zip] {name}: {msg}")
+                        self._log(f"[zip] {name}: {failure}")
                         item["status"] = STATUS_FAILED
-                        item["last_error"] = msg
+                        item["last_error"] = failure
                         continue
                     _hex, b64, size = md5_file(zip_path)
                     item["zip_md5_b64"] = b64
                     item["zip_size_bytes"] = size
                     item["status"] = STATUS_ZIPPED
                     self._log(f"[zip] {name}: ready ({size / 1e6:.1f} MB, "
-                              f"{files_added} files, md5={b64})")
+                              f"{files_added} files, "
+                              f"{source_bytes / 1e6:.1f} MB uncompressed, "
+                              f"md5={b64})")
                     self._zip_queue.put((m, path, name, zip_path))
             self._zip_queue.put(None)
         except Exception as e:
@@ -2347,37 +2360,82 @@ class DownloadSession:
 NO_COMPRESS_EXTS = {".jpg", ".jpeg"}
 
 
-def _make_zip(src_dir: Path, out_path: Path) -> int:
-    """Zip a mission folder for upload. Returns the count of files
-    actually written into the archive.
+def _make_zip(src_dir: Path, out_path: Path) -> tuple[int, set[str], int]:
+    """Zip a mission folder for upload. Returns (files_added, arcnames,
+    total_uncompressed_bytes) so the caller can cross-check the produced
+    archive against what it actually saw on disk.
 
     Everything gets DEFLATE at level 9 except already-compressed formats
     (.jpg / .jpeg), which we ZIP_STORE because re-compressing them just
     burns CPU without shrinking the payload. On the slow / intermittent
     links this tool targets, a smaller zip is worth the CPU cost.
 
-    Returning the count lets the caller compare against the manifest's
-    ``file_count`` and fail hard on a silent mismatch -- otherwise a
-    transient rglob() coming back empty produces a valid but empty
-    22-byte archive that md5-verifies against itself on the blob and
-    gets silently marked verified.
+    Returning both counts and the arcname set lets the caller run
+    filename-set + uncompressed-size defense-in-depth checks -- otherwise
+    a transient rglob() coming back empty or a partial write silently
+    ships an archive that md5-verifies against itself on the blob and
+    gets marked verified.
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = out_path.with_suffix(out_path.suffix + ".part")
     files_added = 0
+    arcnames: set[str] = set()
+    source_bytes = 0
     with zipfile.ZipFile(tmp, "w", allowZip64=True) as zf:
         for p in sorted(src_dir.rglob("*")):
             if not p.is_file():
                 continue
             arcname = p.relative_to(src_dir.parent).as_posix()
+            try:
+                source_bytes += p.stat().st_size
+            except Exception:
+                # If stat fails right before write, let zf.write raise so
+                # the whole zip attempt fails rather than silently mis-
+                # counting.
+                pass
             if p.suffix.lower() in NO_COMPRESS_EXTS:
                 zf.write(p, arcname=arcname, compress_type=zipfile.ZIP_STORED)
             else:
                 zf.write(p, arcname=arcname,
                          compress_type=zipfile.ZIP_DEFLATED, compresslevel=9)
+            arcnames.add(arcname)
             files_added += 1
     tmp.replace(out_path)
-    return files_added
+    return files_added, arcnames, source_bytes
+
+
+def _validate_zip_contents(zip_path: Path,
+                            expected_arcnames: set[str],
+                            expected_uncompressed_bytes: int) -> None:
+    """Cheap post-hoc structural sanity checks on a fresh zip: the
+    archive's central directory must list exactly the arcnames we
+    intended to write, and the sum of stored uncompressed sizes must
+    match what we read off disk while zipping. Reads only the central
+    directory (~30 bytes per entry), so cost is trivial even for a
+    60 GB archive. Raises on mismatch; caller treats as a zip failure."""
+    with zipfile.ZipFile(zip_path) as zf:
+        infos = zf.infolist()
+    got_names = {info.filename for info in infos}
+    missing = expected_arcnames - got_names
+    extra = got_names - expected_arcnames
+    if missing or extra:
+        detail = ""
+        if missing:
+            sample = ", ".join(sorted(missing)[:3])
+            detail = f"; first missing: {sample}"
+        elif extra:
+            sample = ", ".join(sorted(extra)[:3])
+            detail = f"; first unexpected: {sample}"
+        raise RuntimeError(
+            f"zip content mismatch: missing={len(missing)} "
+            f"extra={len(extra)}{detail}"
+        )
+    got_bytes = sum(info.file_size for info in infos)
+    if got_bytes != expected_uncompressed_bytes:
+        raise RuntimeError(
+            f"zip uncompressed-bytes mismatch: archive={got_bytes} "
+            f"source={expected_uncompressed_bytes}"
+        )
 
 
 # --- README placeholders -----------------------------------------------------
