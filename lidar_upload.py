@@ -105,6 +105,8 @@ VALID_PILOTS = [
     "Christian McAlister",
     "Jacob Wyble",
     "Je'Shaun Mitchell",
+    "Burgin Foster",
+    "Justin Manilla",
 ]
 # Known feeder names. The wizard autocompletes against this list, but a pilot
 # can type a custom feeder for troubleshooting / one-offs (warning is emitted
