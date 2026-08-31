@@ -860,19 +860,171 @@ def _finalize_summary(m: dict) -> None:
     m["updated_utc"] = utcnow()
 
 
-def save_cloud_manifest(m: dict) -> None:
-    _finalize_summary(m)
-    data = json.dumps(m, indent=2, sort_keys=True).encode("utf-8")
-    blob_put_bytes(blob_url_for_path(m["manifest_blob_path"]), data, content_type="application/json")
-    # Fire-and-forget master-index update so the Upload Tracker page has a
-    # single-blob view of every session. Failure here is non-fatal; the
-    # tracker's Refresh button rebuilds by re-enumerating.
-    def _bg_index():
+def _fetch_manifest_with_etag(blob_path: str) -> tuple[dict | None, str]:
+    """Return (manifest, etag) for a blob path, or (None, '') if 404."""
+    url = blob_url_for_path(blob_path)
+    try:
+        with urllib.request.urlopen(url, timeout=120) as r:
+            data = r.read()
+            etag = r.headers.get("ETag", "")
+            return json.loads(data.decode("utf-8")), etag
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None, ""
+        raise
+
+
+# Workflow-status precedence for the merge tiebreaker. Anything more
+# advanced wins when two views disagree and neither is VERIFIED.
+_MANIFEST_STATUS_RANK = {
+    STATUS_PENDING: 0,
+    STATUS_FAILED: 1,
+    STATUS_ZIPPING: 2,
+    STATUS_ZIPPED: 3,
+    STATUS_UPLOADING: 4,
+    STATUS_UPLOADED: 5,
+    STATUS_VERIFIED: 6,
+}
+
+
+def _pick_better_item(a: dict | None, b: dict | None) -> dict:
+    """Choose between two views of the same item name during a
+    concurrent-writer merge. VERIFIED always wins over non-VERIFIED
+    (it's terminal, and losing a verified status would drop the md5 /
+    size / uploaded_utc); otherwise later uploaded_utc wins; otherwise
+    higher workflow-status rank wins; final tiebreaker keeps ``a``."""
+    if a is None:
+        return b
+    if b is None:
+        return a
+    a_ver = a.get("status") == STATUS_VERIFIED
+    b_ver = b.get("status") == STATUS_VERIFIED
+    if a_ver and not b_ver:
+        return a
+    if b_ver and not a_ver:
+        return b
+    a_up = a.get("uploaded_utc") or ""
+    b_up = b.get("uploaded_utc") or ""
+    if a_up != b_up:
+        return a if a_up > b_up else b
+    ar = _MANIFEST_STATUS_RANK.get(a.get("status"), 0)
+    br = _MANIFEST_STATUS_RANK.get(b.get("status"), 0)
+    if ar != br:
+        return a if ar > br else b
+    return a
+
+
+def _merge_manifest_for_write(local: dict, remote: dict,
+                               force_item_names: set[str] | None = None) -> dict:
+    """Combine a local manifest with the current remote view into what
+    should actually be PUT. Preserves the most-advanced status per item
+    across concurrent writers, and keeps other pilots' items intact.
+
+    Top-level identity (pilot_name / system_name / session_id) comes
+    from local -- local is the current writer so it identifies the most
+    recent activity. created_utc keeps the earliest of the two.
+
+    ``force_item_names`` names items whose local view should overwrite
+    remote regardless of the normal merge rules. Repair uses this to
+    push a status=pending reset that would otherwise be dropped by the
+    VERIFIED-wins rule when the blob's cloud metadata still says
+    verified but the blob content is bad."""
+    merged: dict = dict(remote)  # start from remote as a shallow base
+    # Top-level identity + fixed structural fields come from local.
+    for k in ("pilot_name", "system_name", "session_id",
+              "client", "program", "feeder", "kind", "sensor", "data_type",
+              "collection_date", "manifest_blob_path", "version",
+              "source_roots"):
+        if local.get(k) is not None:
+            merged[k] = local[k]
+    lc = local.get("created_utc") or ""
+    rc = remote.get("created_utc") or ""
+    if lc and (not rc or lc < rc):
+        merged["created_utc"] = lc
+    forced = force_item_names or set()
+    out_items: dict[str, dict] = {}
+    all_names = set(local.get("items", {})) | set(remote.get("items", {}))
+    for name in all_names:
+        litem = local.get("items", {}).get(name)
+        ritem = remote.get("items", {}).get(name)
+        if name in forced and litem is not None:
+            out_items[name] = litem
+        else:
+            out_items[name] = _pick_better_item(litem, ritem)
+    merged["items"] = out_items
+    return merged
+
+
+def save_cloud_manifest(m: dict,
+                        force_item_names: set[str] | None = None) -> None:
+    """PUT the manifest with optimistic concurrency: fetch remote +
+    ETag, merge our local view with remote via
+    _merge_manifest_for_write, then PUT with If-Match. On 412 (another
+    writer got there first) refetch and retry. On success ``m`` is
+    mutated in place to reflect what was actually written -- so the
+    caller's next save has an up-to-date baseline that already includes
+    concurrent pilots' work.
+
+    Without this, two pilots sharing a manifest each blind-PUT their
+    own stale snapshot after every mission, silently rolling back the
+    other's verified statuses (and dropping the associated md5/size)
+    even though the zips are already on the blob.
+
+    ``force_item_names`` overrides the "VERIFIED wins" rule for the
+    listed items; used by Repair, which needs to push status=pending
+    to trigger a re-upload even though the cloud item may still say
+    verified (its blob is what's actually bad)."""
+    path = m["manifest_blob_path"]
+    url = blob_url_for_path(path)
+    last_err: Exception | None = None
+    for _attempt in range(8):
         try:
-            upsert_master_index_entry(m)
-        except Exception:
-            pass
-    threading.Thread(target=_bg_index, daemon=True).start()
+            remote, etag = _fetch_manifest_with_etag(path)
+        except Exception as e:
+            last_err = e
+            time.sleep(0.5)
+            continue
+        if remote is None:
+            to_write = dict(m)
+            # Ensure items dict is present
+            to_write.setdefault("items", {})
+            precondition_header = ("If-None-Match", "*")
+        else:
+            to_write = _merge_manifest_for_write(m, remote, force_item_names)
+            precondition_header = ("If-Match", etag) if etag else ("If-Match", "*")
+        _finalize_summary(to_write)
+        body = json.dumps(to_write, indent=2, sort_keys=True).encode("utf-8")
+        req = urllib.request.Request(url, data=body, method="PUT")
+        req.add_header("x-ms-blob-type", "BlockBlob")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Content-Length", str(len(body)))
+        req.add_header(*precondition_header)
+        try:
+            with urllib.request.urlopen(req, timeout=120) as r:
+                if r.status in (200, 201):
+                    # Reflect the merged state back into ``m`` so the caller's
+                    # next save() sees any concurrent-writer items we merged.
+                    m.clear()
+                    m.update(to_write)
+                    # Fire-and-forget master-index update as before.
+                    def _bg_index():
+                        try:
+                            upsert_master_index_entry(m)
+                        except Exception:
+                            pass
+                    threading.Thread(target=_bg_index, daemon=True).start()
+                    return
+        except urllib.error.HTTPError as e:
+            if e.code in (409, 412):
+                # Someone else won the race; refetch fresh remote + etag
+                # and retry the merge.
+                last_err = e
+                continue
+            raise
+    raise RuntimeError(
+        f"save_cloud_manifest: retries exhausted for {path}"
+        + (f" (last error: {last_err})" if last_err else "")
+    )
 
 
 def load_cloud_manifest_at(blob_path: str) -> dict | None:
@@ -2029,7 +2181,12 @@ def repair_manifest_for_reupload(m: dict, local_path: Path,
         item["last_error"] = f"Repaired by validation: {res.get('detail', res.get('category'))}"
         repaired.append(name)
     if repaired:
-        save_cloud_manifest(m)
+        # Force these items to overwrite whatever cloud says -- Repair's
+        # intent is "the blob is bad, reset this to pending so the next
+        # session re-uploads". Without forcing, the CAS merge would see
+        # cloud's stale VERIFIED and keep it, silently no-oping the
+        # repair.
+        save_cloud_manifest(m, force_item_names=set(repaired))
         save_local_manifest(m, local_path)
     return repaired
 
