@@ -3796,58 +3796,96 @@ class DeletionCheckDialog(tk.Toplevel):
         self.after(0, finish)
 
     def _reconcile(self):
-        """Standalone action: for the selected manifest, HEAD every
-        non-verified item's expected blob URL and, where the blob
-        actually exists with a Content-MD5, mark the item verified
-        using the blob's own md5+size. No re-upload, no re-hashing.
-        Fixes the case where a manifest write got clobbered by a
-        concurrent pilot but the physical blob is fine."""
+        """Standalone action: for the selected manifest, fetch the CURRENT
+        cloud manifest (not this pilot's local copy -- the whole point of
+        the two-pilot clobber case is that local looks fine but cloud is
+        stale), HEAD every non-verified item's expected blob URL, and
+        where the blob actually exists with a Content-MD5, mark the item
+        verified using the blob's own md5+size. No re-upload, no
+        re-hashing."""
         sel = self.tree.selection()
         if not sel:
             messagebox.showerror("Pick one", "Select a manifest row first.")
             return
         path = Path(sel[0])
-        m = self._manifests.get(str(path))
-        if not m:
+        local_m = self._manifests.get(str(path))
+        if not local_m:
             messagebox.showerror("Load failed", "Could not read that manifest.")
             return
-        non_verified = sum(1 for it in m.get("items", {}).values()
-                           if it.get("status") != STATUS_VERIFIED)
-        if non_verified == 0:
-            messagebox.showinfo(
-                "Nothing to do",
-                "Every item in that manifest is already verified.",
-            )
-            return
-        if not messagebox.askyesno(
-            "Confirm reconcile",
-            f"HEAD every non-verified item ({non_verified}) against the "
-            f"blob for {m.get('feeder')} / {m.get('kind')} / "
-            f"{m.get('collection_date')}.\n\n"
-            f"Any item whose blob is present with a Content-MD5 is "
-            f"marked verified using the blob's own md5 + size -- no "
-            f"re-upload. Items whose blob is missing (or has no "
-            f"Content-MD5) are left as-is; run 'Repair manifest for "
-            f"re-upload' for those.\n\nProceed?",
-        ):
-            return
+        # We need the CLOUD manifest, not local. Fetching is I/O so run the
+        # whole thing on a worker thread (starts with a "please wait" note).
         self.result_text.delete("1.0", "end")
-        self.verdict_var.set("Reconciling from blob... please wait.")
+        self.verdict_var.set("Fetching cloud manifest...")
         self._cancel.clear()
         self.stop_btn.state(["!disabled"])
         self.repair_btn.state(["disabled"])
         self._last_result = None
         self._last_result_path = path
+        blob_path = local_m.get("manifest_blob_path")
+
+        def log(msg: str):
+            self.after(0, lambda: self._append(msg))
 
         def worker():
-            def log(msg: str):
-                self.after(0, lambda: self._append(msg))
-            self.after(0, lambda: self._append(
-                f"Reconciling {non_verified} non-verified item(s) in "
-                f"{m.get('feeder')} / {m.get('kind')} / "
-                f"{m.get('collection_date')} ...\n"))
+            # Step 1: fetch the current cloud manifest.
             try:
-                result = reconcile_manifest_from_blob(m, path, log, self._cancel)
+                cloud_m = load_cloud_manifest_at(blob_path)
+            except Exception as e:
+                self.after(0, lambda: self._append(f"\nERROR fetching cloud: {e}\n"))
+                self.after(0, lambda: self.verdict_var.set("Reconcile failed."))
+                self.after(0, lambda: self.stop_btn.state(["disabled"]))
+                return
+            if cloud_m is None:
+                self.after(0, lambda: messagebox.showinfo(
+                    "No cloud manifest",
+                    f"No manifest.json exists at:\n{blob_path}\n\n"
+                    f"Nothing to reconcile from -- upload first."))
+                self.after(0, lambda: self.verdict_var.set("No cloud manifest."))
+                self.after(0, lambda: self.stop_btn.state(["disabled"]))
+                return
+            non_verified = sum(1 for it in cloud_m.get("items", {}).values()
+                               if it.get("status") != STATUS_VERIFIED)
+            if non_verified == 0:
+                self.after(0, lambda: messagebox.showinfo(
+                    "Nothing to do",
+                    f"The cloud manifest at\n{blob_path}\n"
+                    f"already shows every item as verified. Nothing to "
+                    f"reconcile."))
+                self.after(0, lambda: self.verdict_var.set("Cloud is already fully verified."))
+                self.after(0, lambda: self.stop_btn.state(["disabled"]))
+                return
+
+            # Step 2: confirm with the pilot on the UI thread.
+            proceed = {"go": False}
+            evt = threading.Event()
+
+            def ask():
+                proceed["go"] = messagebox.askyesno(
+                    "Confirm reconcile",
+                    f"Cloud manifest has {non_verified} non-verified "
+                    f"item(s) for {cloud_m.get('feeder')} / "
+                    f"{cloud_m.get('kind')} / "
+                    f"{cloud_m.get('collection_date')}.\n\n"
+                    f"HEAD every one against the blob. Any item whose "
+                    f"blob is present with a Content-MD5 is marked "
+                    f"verified using the blob's own md5 + size -- no "
+                    f"re-upload. Items whose blob is missing (or has "
+                    f"no Content-MD5) are left as-is; use 'Repair "
+                    f"manifest for re-upload' for those.\n\nProceed?")
+                evt.set()
+            self.after(0, ask)
+            evt.wait()
+            if not proceed["go"]:
+                self.after(0, lambda: self.verdict_var.set("Cancelled."))
+                self.after(0, lambda: self.stop_btn.state(["disabled"]))
+                return
+
+            log(f"Reconciling {non_verified} non-verified item(s) in "
+                f"{cloud_m.get('feeder')} / {cloud_m.get('kind')} / "
+                f"{cloud_m.get('collection_date')} ...\n")
+            try:
+                result = reconcile_manifest_from_blob(
+                    cloud_m, path, log, self._cancel)
             except Exception as e:
                 self.after(0, lambda: self._append(f"\nERROR: {e}\n"))
                 self.after(0, lambda: self.verdict_var.set("Reconcile failed."))
@@ -3873,8 +3911,9 @@ class DeletionCheckDialog(tk.Toplevel):
                     self._append(f"\n{len(err)} error(s):\n")
                     for e in err:
                         self._append(f"  ?? {e}\n")
-                # Refresh the cached manifest so the tree row shows fresh
-                # verified counts.
+                # Refresh the cached local manifest so the tree row shows
+                # fresh verified counts (reconcile_manifest_from_blob wrote
+                # the updated view to disk at `path` via save_local_manifest).
                 try:
                     self._manifests[str(path)] = load_local_manifest(path)
                 except Exception:
