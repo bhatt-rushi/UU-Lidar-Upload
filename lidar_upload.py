@@ -2191,6 +2191,83 @@ def repair_manifest_for_reupload(m: dict, local_path: Path,
     return repaired
 
 
+def reconcile_manifest_from_blob(m: dict, local_path: Path,
+                                  log,
+                                  cancel_event: threading.Event | None = None
+                                  ) -> dict:
+    """For every non-verified item, HEAD the blob it would be at and, if
+    the blob actually exists and carries a Content-MD5, mark the item
+    verified using the blob's own Content-MD5 + Content-Length. Zero
+    re-upload -- fixes the case where a manifest write got clobbered by
+    a concurrent pilot but the zip / .dat is physically on the blob.
+
+    Safe because this tool always uploads with azcopy's --put-md5, so
+    the blob's Content-MD5 is byte-identical to what would have been in
+    zip_md5_b64 / md5_b64 had the manifest write not been lost -- it's
+    the exact same equivalence the normal verify path relies on.
+
+    Returns {"reconciled": [names], "still_missing": [names],
+             "errors": [str, ...]}.
+    """
+    reconciled: list[str] = []
+    still_missing: list[str] = []
+    errors: list[str] = []
+    subdir = DIR_SENSOR_DATA if m["kind"] == KIND_SENSOR else DIR_BASE_STATION
+    for name, item in m["items"].items():
+        if cancel_event is not None and cancel_event.is_set():
+            errors.append("Cancelled before all items were checked.")
+            break
+        if item.get("status") == STATUS_VERIFIED:
+            continue
+        blob_name = f"{name}.zip" if m["kind"] == KIND_SENSOR else name
+        url = blob_url(m["client"], m["program"], m["feeder"],
+                       subdir, m["collection_date"], blob_name)
+        log(f"  reconciling {name} ...")
+        try:
+            headers = blob_head(url)
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                still_missing.append(name)
+                continue
+            errors.append(f"{name}: HEAD failed ({e})")
+            continue
+        except Exception as e:
+            errors.append(f"{name}: HEAD failed ({e})")
+            continue
+        remote_md5 = headers.get("content-md5")
+        try:
+            remote_size = int(headers.get("content-length", "0"))
+        except ValueError:
+            remote_size = 0
+        if not remote_md5:
+            # Blob is there but was uploaded without --put-md5 (not by
+            # this tool, or by a much older version). We can't safely
+            # mark verified without an md5 to record.
+            errors.append(f"{name}: blob exists but has no Content-MD5; "
+                          f"can't reconcile safely, re-upload instead")
+            continue
+        # Update the item to look like a normal completed upload.
+        if m["kind"] == KIND_SENSOR:
+            item["zip_md5_b64"] = remote_md5
+            item["zip_size_bytes"] = remote_size
+        else:
+            item["md5_b64"] = remote_md5
+            item["size_bytes"] = remote_size
+        item["status"] = STATUS_VERIFIED
+        item["uploaded_utc"] = utcnow()
+        item["last_error"] = None
+        item["azcopy_job_id"] = None
+        reconciled.append(name)
+    if reconciled:
+        # Force these items to overwrite cloud -- cloud's the source of
+        # the stale metadata we're fixing, so its "pending" view must not
+        # be picked by the merge tiebreaker.
+        save_cloud_manifest(m, force_item_names=set(reconciled))
+        save_local_manifest(m, local_path)
+    return {"reconciled": reconciled, "still_missing": still_missing,
+            "errors": errors}
+
+
 def _fmt_bytes(n: int) -> str:
     if n <= 0:
         return "0 B"
@@ -3516,6 +3593,8 @@ class DeletionCheckDialog(tk.Toplevel):
                                      command=self._repair)
         self.repair_btn.pack(side="left", padx=6)
         self.repair_btn.state(["disabled"])
+        ttk.Button(btns, text="Reconcile from blob",
+                   command=self._reconcile).pack(side="left", padx=6)
         ttk.Button(btns, text="Close", command=self.destroy).pack(side="right")
 
         result_frame = ttk.LabelFrame(self, text="Result")
@@ -3715,6 +3794,100 @@ class DeletionCheckDialog(tk.Toplevel):
                 self.repair_btn.state(["disabled"])
             self._append(f"\nManifest file: {path}\n")
         self.after(0, finish)
+
+    def _reconcile(self):
+        """Standalone action: for the selected manifest, HEAD every
+        non-verified item's expected blob URL and, where the blob
+        actually exists with a Content-MD5, mark the item verified
+        using the blob's own md5+size. No re-upload, no re-hashing.
+        Fixes the case where a manifest write got clobbered by a
+        concurrent pilot but the physical blob is fine."""
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showerror("Pick one", "Select a manifest row first.")
+            return
+        path = Path(sel[0])
+        m = self._manifests.get(str(path))
+        if not m:
+            messagebox.showerror("Load failed", "Could not read that manifest.")
+            return
+        non_verified = sum(1 for it in m.get("items", {}).values()
+                           if it.get("status") != STATUS_VERIFIED)
+        if non_verified == 0:
+            messagebox.showinfo(
+                "Nothing to do",
+                "Every item in that manifest is already verified.",
+            )
+            return
+        if not messagebox.askyesno(
+            "Confirm reconcile",
+            f"HEAD every non-verified item ({non_verified}) against the "
+            f"blob for {m.get('feeder')} / {m.get('kind')} / "
+            f"{m.get('collection_date')}.\n\n"
+            f"Any item whose blob is present with a Content-MD5 is "
+            f"marked verified using the blob's own md5 + size -- no "
+            f"re-upload. Items whose blob is missing (or has no "
+            f"Content-MD5) are left as-is; run 'Repair manifest for "
+            f"re-upload' for those.\n\nProceed?",
+        ):
+            return
+        self.result_text.delete("1.0", "end")
+        self.verdict_var.set("Reconciling from blob... please wait.")
+        self._cancel.clear()
+        self.stop_btn.state(["!disabled"])
+        self.repair_btn.state(["disabled"])
+        self._last_result = None
+        self._last_result_path = path
+
+        def worker():
+            def log(msg: str):
+                self.after(0, lambda: self._append(msg))
+            self.after(0, lambda: self._append(
+                f"Reconciling {non_verified} non-verified item(s) in "
+                f"{m.get('feeder')} / {m.get('kind')} / "
+                f"{m.get('collection_date')} ...\n"))
+            try:
+                result = reconcile_manifest_from_blob(m, path, log, self._cancel)
+            except Exception as e:
+                self.after(0, lambda: self._append(f"\nERROR: {e}\n"))
+                self.after(0, lambda: self.verdict_var.set("Reconcile failed."))
+                self.after(0, lambda: self.stop_btn.state(["disabled"]))
+                return
+
+            def finish():
+                self.stop_btn.state(["disabled"])
+                r = result["reconciled"]
+                sm = result["still_missing"]
+                err = result["errors"]
+                if r:
+                    self._append(f"\nReconciled {len(r)} item(s) to verified "
+                                 f"using blob md5/size:\n")
+                    for n in r:
+                        self._append(f"  * {n}\n")
+                if sm:
+                    self._append(f"\n{len(sm)} item(s) had no blob on Azure "
+                                 f"(still need re-upload):\n")
+                    for n in sm:
+                        self._append(f"  - {n}\n")
+                if err:
+                    self._append(f"\n{len(err)} error(s):\n")
+                    for e in err:
+                        self._append(f"  ?? {e}\n")
+                # Refresh the cached manifest so the tree row shows fresh
+                # verified counts.
+                try:
+                    self._manifests[str(path)] = load_local_manifest(path)
+                except Exception:
+                    pass
+                self._refill()
+                summary = f"{len(r)} reconciled, {len(sm)} still missing"
+                if err:
+                    summary += f", {len(err)} error(s)"
+                self.verdict_var.set(summary)
+                self._append(f"\nManifest file: {path}\n")
+            self.after(0, finish)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _repair(self):
         if not self._last_result or not self._last_result_path:
