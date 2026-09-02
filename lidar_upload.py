@@ -295,6 +295,14 @@ def blob_url(*path_parts: str) -> str:
     return f"{BLOB_URL_BASE}/{quoted}{SAS_TOKEN}"
 
 
+def blob_url_no_sas(*path_parts: str) -> str:
+    """Same shape as blob_url but without the SAS query string. For log
+    output where we want the pilot to compare against what Storage
+    Explorer shows without leaking credentials."""
+    quoted = "/".join(urllib.parse.quote(p, safe="") for p in path_parts if p)
+    return f"{BLOB_URL_BASE}/{quoted}"
+
+
 def blob_url_for_path(blob_path: str) -> str:
     """Blob URL for a slash-joined path, appending SAS."""
     parts = [p for p in blob_path.split("/") if p]
