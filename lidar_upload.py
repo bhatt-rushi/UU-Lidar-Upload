@@ -3827,20 +3827,80 @@ class DeletionCheckDialog(tk.Toplevel):
             self.after(0, lambda: self._append(msg))
 
         def worker():
-            # Step 1: fetch the current cloud manifest.
-            try:
-                cloud_m = load_cloud_manifest_at(blob_path)
-            except Exception as e:
-                self.after(0, lambda: self._append(f"\nERROR fetching cloud: {e}\n"))
+            # Step 1: fetch the cloud manifest at the path the local file
+            # points at. If that 404s, fall back to a path recomputed from
+            # the local manifest's declarative fields -- this catches the
+            # case where an older tool version wrote the wrong
+            # manifest_blob_path into the local file.
+            tried_paths: list[str] = []
+            cloud_m = None
+            fetch_error: Exception | None = None
+
+            def _try(p: str):
+                nonlocal cloud_m, fetch_error
+                if not p or p in tried_paths:
+                    return
+                tried_paths.append(p)
+                log(f"[reconcile] fetching cloud manifest: {p}\n")
+                try:
+                    cloud_m = load_cloud_manifest_at(p)
+                except Exception as e:
+                    fetch_error = e
+                    log(f"[reconcile]   fetch error: {e}\n")
+
+            _try(blob_path)
+            if cloud_m is None and fetch_error is None:
+                # Stored path returned 404 (not a hard error). Try a fresh
+                # recomputed path from local's fields.
+                try:
+                    recomputed = manifest_blob_path_for(
+                        local_m.get("kind"),
+                        local_m.get("client"),
+                        local_m.get("program"),
+                        local_m.get("feeder"),
+                        local_m.get("collection_date"),
+                    )
+                except Exception:
+                    recomputed = None
+                if recomputed and recomputed != blob_path:
+                    _try(recomputed)
+                    if cloud_m is not None:
+                        # Repair the local manifest so future ops don't
+                        # keep hitting the wrong URL.
+                        local_m["manifest_blob_path"] = recomputed
+                        cloud_m["manifest_blob_path"] = recomputed
+                        try:
+                            save_local_manifest(local_m, path)
+                        except Exception:
+                            pass
+                        log(f"[reconcile] recovered via recomputed path; "
+                            f"local manifest_blob_path fixed to {recomputed}\n")
+
+            if fetch_error is not None and cloud_m is None:
+                self.after(0, lambda: self._append(
+                    f"\nERROR fetching cloud: {fetch_error}\n"))
                 self.after(0, lambda: self.verdict_var.set("Reconcile failed."))
                 self.after(0, lambda: self.stop_btn.state(["disabled"]))
                 return
+
             if cloud_m is None:
-                self.after(0, lambda: messagebox.showinfo(
-                    "No cloud manifest",
-                    f"No manifest.json exists at:\n{blob_path}\n\n"
-                    f"Nothing to reconcile from -- upload first."))
-                self.after(0, lambda: self.verdict_var.set("No cloud manifest."))
+                # Build a detailed diagnostic including the full URLs we
+                # actually hit (no SAS) so the pilot can compare against
+                # what they see in Storage Explorer.
+                tried_urls = "\n".join(
+                    f"  {p}\n    URL: {blob_url_no_sas(*[x for x in p.split('/') if x])}"
+                    for p in tried_paths
+                )
+                msg = (
+                    f"No manifest.json found on the blob at any of the paths "
+                    f"we tried:\n\n{tried_urls}\n\n"
+                    f"If Storage Explorer shows the manifest at a different "
+                    f"path, the local file's stored manifest_blob_path is "
+                    f"wrong -- send me the actual path and I can extend the "
+                    f"fallback."
+                )
+                self.after(0, lambda: messagebox.showinfo("No cloud manifest", msg))
+                self.after(0, lambda: self.verdict_var.set("No cloud manifest at tried paths."))
                 self.after(0, lambda: self.stop_btn.state(["disabled"]))
                 return
             non_verified = sum(1 for it in cloud_m.get("items", {}).values()
