@@ -2031,11 +2031,20 @@ def verify_manifest_for_deletion(m: dict,
     skipped = 0
     subdir = DIR_SENSOR_DATA if m["kind"] == KIND_SENSOR else DIR_BASE_STATION
 
+    # Diagnostic: dump the top-level fields we'll use to construct blob
+    # URLs so the pilot can spot a mangled manifest field (wrong feeder /
+    # date / kind) at a glance if HEADs start 404ing on things they know
+    # exist on the blob.
+    log(f"  manifest: client={m.get('client')!r} program={m.get('program')!r} "
+        f"feeder={m.get('feeder')!r} kind={m.get('kind')!r} "
+        f"date={m.get('collection_date')!r} items={len(m.get('items', {}))}")
+
     def _record(name: str, category: str | None, detail: str = ""):
         item_results[name] = {"category": category, "detail": detail}
         if category is not None:
             issues.append(detail)
 
+    first_url_logged = False
     for name, item in m["items"].items():
         if cancel_event is not None and cancel_event.is_set():
             issues.append("Cancelled before all items were checked.")
@@ -2045,6 +2054,11 @@ def verify_manifest_for_deletion(m: dict,
             continue
         checked += 1
         log(f"  checking {name} ...")
+        if not first_url_logged:
+            _bn = f"{name}.zip" if m["kind"] == KIND_SENSOR else name
+            log(f"  first HEAD URL (SAS redacted): "
+                f"{blob_url_no_sas(m.get('client', ''), m.get('program', ''), m.get('feeder', ''), subdir, m.get('collection_date', ''), _bn)}")
+            first_url_logged = True
 
         if item.get("status") != STATUS_VERIFIED:
             _record(name, "not_verified",
